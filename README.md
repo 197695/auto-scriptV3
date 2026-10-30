@@ -28,7 +28,7 @@ Protocoles : SSH, SlowDNS, UDP, Xray (Vmess / Vless / Trojan), Shadowsocks, Wire
 ## Installation (une ligne)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Boblevel/auto-scriptV3/main/setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/197695/auto-scriptV3/main/setup.sh)
 ```
 
 ## Ouvrir le panel
