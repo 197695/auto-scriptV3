@@ -1,0 +1,234 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · comptes Hysteria2
+#  Comptes dans /etc/nvpanel/db/hysteria (### user pass exp [L]).
+#  /etc/hysteria/config.yaml est ENTIÈREMENT régénéré à chaque
+#  changement : contrairement à Xray, ce fichier n'est jamais édité
+#  à la main ailleurs — une réécriture complète est donc sans danger
+#  ici, et bien plus fiable qu'un patch YAML partiel.
+#  Usage : nvpanel-hysteria add|list|info|del|renew|lock|unlock|purge|rebuild|online ...
+# ============================================================
+DB=/etc/nvpanel/db/hysteria
+CONF=/etc/hysteria/config.yaml
+HAPI_SECRET=/etc/nvpanel/hysteria_api_secret
+HAPI_URL=http://127.0.0.1:9999
+umask 077
+mkdir -p /etc/nvpanel/db; chmod 700 /etc/nvpanel/db 2>/dev/null
+touch "$DB"; chmod 600 "$DB" 2>/dev/null
+
+_clean(){ printf '%s' "$1" | tr -d '\r\n\t '; }
+_valid_name(){ [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]]; }
+_valid_new_name(){ [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; }
+_rx(){ printf '%s' "$1" | sed 's/\./[.]/g'; }
+_valid_password(){
+  [ "${#1}" -ge 4 ] && [ "${#1}" -le 128 ] \
+    && printf '%s' "$1" | LC_ALL=C grep -qE '^[A-Za-z0-9@%+=_.!#$^~-]+$'
+}
+# Affichage uniquement (JJ-MM-AAAA) — les dates restent stockées en AAAA-MM-JJ
+# partout ailleurs, les comparaisons de tri en dépendent.
+_fmtd(){ [ -n "$1" ] && date -d "$1" +"%d-%m-%Y" 2>/dev/null || printf '%s' "$1"; }
+
+_conf_permissions(){
+  local service_user service_group
+  service_user=$(systemctl show -p User --value hysteria-server 2>/dev/null)
+  service_user=${service_user:-hysteria}
+  id "$service_user" >/dev/null 2>&1 || service_user=root
+  service_group=$(systemctl show -p Group --value hysteria-server 2>/dev/null)
+  service_group=${service_group:-$(id -gn "$service_user" 2>/dev/null)}
+  [ -n "$service_group" ] || return 1
+  chown root:"$service_group" "$(dirname "$CONF")" "$CONF" 2>/dev/null || return 1
+  chmod 750 "$(dirname "$CONF")" 2>/dev/null || return 1
+  chmod 640 "$CONF" 2>/dev/null || return 1
+}
+
+_rebuild(){
+  local domain cert tmp today active api_secret
+  domain=$(cat /etc/nvpanel/domain 2>/dev/null)
+  [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] \
+    && [ "${#domain}" -le 253 ] || return 1
+  cert="/etc/letsencrypt/live/$domain"
+  [ -f "$cert/fullchain.pem" ] && [ -f "$cert/privkey.pem" ] || return 1
+  mkdir -p /etc/hysteria
+  if [ ! -s "$HAPI_SECRET" ]; then
+    umask 077
+    openssl rand -hex 24 > "$HAPI_SECRET" 2>/dev/null || return 2
+    chmod 600 "$HAPI_SECRET" 2>/dev/null || return 2
+  fi
+  api_secret=$(head -n1 "$HAPI_SECRET" 2>/dev/null)
+  [ -n "$api_secret" ] || return 2
+  tmp=$(mktemp /etc/hysteria/.config.yaml.XXXXXX) || return 1
+  today=$(date +%F)
+  active=$(awk -v d="$today" '/^### / && $5!="L" && $4>d{n++} END{print n+0}' "$DB")
+  {
+    echo "listen: :443"
+    echo "tls:"
+    echo "  cert: $cert/fullchain.pem"
+    echo "  key: $cert/privkey.pem"
+    echo "auth:"
+    echo "  type: userpass"
+    echo "  userpass:"
+    # Les guillemets protègent notamment # et ! dans les mots de passe YAML.
+    # Les validateurs interdisent guillemets et antislash, donc aucune
+    # séquence d'échappement supplémentaire n'est nécessaire ici.
+    awk -v d="$today" '/^### /{ if ($5!="L" && $4>d) printf "    \"%s\": \"%s\"\n", $2, $3 }' "$DB"
+    echo "masquerade:"
+    echo "  type: proxy"
+    echo "  proxy:"
+    echo "    url: https://news.ycombinator.com/"
+    echo "    rewriteHost: true"
+    echo "trafficStats:"
+    echo "  listen: 127.0.0.1:9999"
+    echo "  secret: $api_secret"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$CONF" || { rm -f "$tmp"; return 1; }
+  _conf_permissions || return 2
+  #   0 = configuration écrite et service démarré
+  #   1 = certificat TLS absent (rien n'a été écrit)
+  #   2 = configuration écrite mais service non démarré
+  if [ "$active" -eq 0 ]; then
+    systemctl stop hysteria-server >/dev/null 2>&1 || true
+    return 0
+  fi
+  systemctl restart hysteria-server >/dev/null 2>&1 \
+    && systemctl is-active --quiet hysteria-server || return 2
+  return 0
+}
+
+_box(){ # user pass created exp
+  local u="$1" p="$2" cr="$3" ex="$4" host uri_u uri_p
+  host=$(cat /etc/nvpanel/domain 2>/dev/null)
+  [ -z "$host" ] && host="$(cat /etc/nvpanel/ip 2>/dev/null)"
+  uri_u=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$u" 2>/dev/null); uri_u=${uri_u:-$u}
+  uri_p=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$p" 2>/dev/null); uri_p=${uri_p:-$p}
+  cat <<EOF
+========== ⚡ COMPTE HYSTERIA UDP ==========
+🌐 Hôte        : $host
+🔌 Port        : 443 (UDP)
+👤 Utilisateur : $u
+🔑 Mot de passe: $p
+🔗 Lien        : hy2://$uri_u:$uri_p@$host:443/?sni=$host#$u
+📅 Créé le     : $(_fmtd "$cr")
+⏳ Expire le   : $(_fmtd "$ex")
+==========================================
+EOF
+}
+
+cmd="$1"; shift 2>/dev/null
+exec 9>/run/nvpanel-hysteria.lock
+flock -w 20 9 || { echo "ERR busy"; exit 1; }
+case "$cmd" in
+  add)
+    user=$(_clean "$1"); pass=$(_clean "$2"); days="$3"
+    [ -z "$user" ] || [ -z "$pass" ] && { echo "ERR args"; exit 1; }
+    _valid_new_name "$user" || { echo "ERR username"; exit 1; }
+    _valid_password "$pass" || { echo "ERR password"; exit 1; }
+    [[ "$days" =~ ^[0-9]+$ ]] && [ "$days" -ge 1 ] && [ "$days" -le 3650 ] || { echo "ERR days"; exit 1; }
+    user_rx=$(_rx "$user"); grep -q "^### $user_rx " "$DB" && { echo "ERR exists"; exit 1; }
+    exp=$(date -d "+$days days" +"%Y-%m-%d"); cr=$(date +"%Y-%m-%d")
+    printf '### %s %s %s\n' "$user" "$pass" "$exp" >> "$DB" || { echo "ERR database"; exit 1; }
+    _rebuild; rc=$?
+    if [ "$rc" != 0 ]; then
+      sed -i "/^### $user_rx /d" "$DB"; _rebuild >/dev/null 2>&1 || true
+      [ "$rc" = 1 ] && echo "ERR notls" || echo "ERR service"
+      exit 1
+    fi
+    echo "OK $user $exp"
+    _box "$user" "$pass" "$cr" "$exp" ;;
+  list)
+    today=$(date +%F)
+    awk -v d="$today" '/^### /{ expired=($4!="" && $4<=d); st=($5=="L")?(expired?"exp+verr":"verrou"):(expired?"expiré":"actif"); print $2"|"$4"|"st }' "$DB" 2>/dev/null ;;
+  info)
+    user=$(_clean "$1")
+    _valid_name "$user" || { echo "ERR username"; exit 1; }
+    row=$(grep "^### $(_rx "$user") " "$DB" 2>/dev/null | head -1)
+    [ -z "$row" ] && { echo "ERR nouser"; exit 1; }
+    echo "OK $user"
+    _box "$user" "$(echo "$row" | awk '{print $3}')" "-" "$(echo "$row" | awk '{print $4}')" ;;
+  lock)
+    user=$(_clean "$1")
+    _valid_name "$user" || { echo "ERR username"; exit 1; }
+    user_rx=$(_rx "$user"); grep -q "^### $user_rx " "$DB" 2>/dev/null || { echo "ERR nouser"; exit 1; }
+    old_row=$(grep "^### $user_rx " "$DB" 2>/dev/null | head -1)
+    sed -i "s|^### $user_rx \([^ ]*\) \([^ ]*\).*|### $user \1 \2 L|" "$DB"
+    if ! _rebuild >/dev/null 2>&1; then
+      sed -i "/^### $user_rx /d" "$DB"; printf '%s\n' "$old_row" >> "$DB"
+      _rebuild >/dev/null 2>&1 || true
+      echo "ERR service"; exit 1
+    fi
+    echo "OK locked" ;;
+  unlock)
+    user=$(_clean "$1")
+    _valid_name "$user" || { echo "ERR username"; exit 1; }
+    user_rx=$(_rx "$user"); grep -q "^### $user_rx " "$DB" 2>/dev/null || { echo "ERR nouser"; exit 1; }
+    old_row=$(grep "^### $user_rx " "$DB" 2>/dev/null | head -1)
+    sed -i "s|^### $user_rx \([^ ]*\) \([^ ]*\).*|### $user \1 \2|" "$DB"
+    if ! _rebuild >/dev/null 2>&1; then
+      sed -i "/^### $user_rx /d" "$DB"; printf '%s\n' "$old_row" >> "$DB"
+      _rebuild >/dev/null 2>&1 || true
+      echo "ERR service"; exit 1
+    fi
+    echo "OK unlocked" ;;
+  del)
+    user=$(_clean "$1")
+    _valid_name "$user" || { echo "ERR username"; exit 1; }
+    user_rx=$(_rx "$user"); grep -q "^### $user_rx " "$DB" 2>/dev/null || { echo "ERR nouser"; exit 1; }
+    old_row=$(grep "^### $user_rx " "$DB" 2>/dev/null | head -1)
+    sed -i "/^### $user_rx /d" "$DB"
+    if ! _rebuild >/dev/null 2>&1; then
+      printf '%s\n' "$old_row" >> "$DB"; _rebuild >/dev/null 2>&1 || true
+      echo "ERR service"; exit 1
+    fi
+    echo "OK deleted" ;;
+  renew)
+    user=$(_clean "$1"); days="$2"
+    _valid_name "$user" || { echo "ERR username"; exit 1; }
+    user_rx=$(_rx "$user"); grep -q "^### $user_rx " "$DB" 2>/dev/null || { echo "ERR nouser"; exit 1; }
+    [[ "$days" =~ ^[0-9]+$ ]] && [ "$days" -ge 1 ] && [ "$days" -le 3650 ] || { echo "ERR days"; exit 1; }
+    old_row=$(grep "^### $user_rx " "$DB" 2>/dev/null | head -1)
+    exp=$(date -d "+$days days" +"%Y-%m-%d")
+    sed -i "s|^### $user_rx \([^ ]*\) .*|### $user \1 $exp|" "$DB"
+    if ! _rebuild >/dev/null 2>&1; then
+      sed -i "/^### $user_rx /d" "$DB"; printf '%s\n' "$old_row" >> "$DB"
+      _rebuild >/dev/null 2>&1 || true
+      echo "ERR service"; exit 1
+    fi
+    echo "OK $user $exp" ;;
+  purge)
+    mode=$(_clean "$1"); today=$(date +%F); n=0
+    db_backup=$(mktemp "${DB}.XXXXXX") || { echo "ERR database"; exit 1; }
+    cp -a "$DB" "$db_backup" 2>/dev/null || { rm -f "$db_backup"; echo "ERR database"; exit 1; }
+    list=$(awk -v d="$today" -v m="$mode" '/^### /{ if (m=="all" || ($4!="" && $4<=d)) print $2 }' "$DB" 2>/dev/null)
+    for u in $list; do
+      [ -z "$u" ] && continue
+      sed -i "/^### $(_rx "$u") /d" "$DB"; n=$((n+1))
+    done
+    if [ "$n" -gt 0 ] && ! _rebuild >/dev/null 2>&1; then
+      cp -a "$db_backup" "$DB" 2>/dev/null; rm -f "$db_backup"
+      _rebuild >/dev/null 2>&1 || true
+      echo "ERR service"; exit 1
+    fi
+    rm -f "$db_backup"
+    echo "OK $n" ;;
+  online)
+    mode=$(_clean "$1")
+    systemctl is-active --quiet hysteria-server 2>/dev/null || { [ "$mode" = "all-detail" ] || echo 0; exit 0; }
+    [ -s "$HAPI_SECRET" ] || { [ "$mode" = "all-detail" ] || echo 0; exit 0; }
+    api_secret=$(head -n1 "$HAPI_SECRET" 2>/dev/null)
+    data=$(curl -fsS --max-time 2 -H "Authorization: $api_secret" "$HAPI_URL/online" 2>/dev/null) || data='{}'
+    case "$mode" in
+      all-detail)
+        printf '%s' "$data" | jq -r 'to_entries[]? | "\(.key)|\(.value // 0)"' 2>/dev/null ;;
+      '')
+        printf '%s' "$data" | jq '[.[]? // 0] | add // 0' 2>/dev/null || echo 0 ;;
+      *)
+        printf '%s' "$data" | jq -r --arg u "$mode" '.[$u] // 0' 2>/dev/null || echo 0 ;;
+    esac ;;
+  rebuild)
+    _rebuild; rc=$?
+    if [ "$rc" -eq 0 ]; then echo "OK"
+    elif [ "$rc" -eq 1 ]; then echo "ERR notls"; exit 1
+    else echo "ERR service"; exit 1
+    fi ;;
+  *) echo "usage: nvpanel-hysteria add|list|info|del|renew|lock|unlock|purge|rebuild|online ..."; exit 1 ;;
+esac
+exit 0

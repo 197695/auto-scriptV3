@@ -1,0 +1,447 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · installation UDP   (commande : install-udp)
+#
+#  badvpn-udpgw (UDPGW 7100/7200/7300) installé en 3 essais successifs :
+#    a) paquet de la distribution (rapide, mais absent sur beaucoup de VPS)
+#    b) binaire hébergé dans ton dépôt GitHub (si tu en fournis un)
+#    c) compilation depuis la source officielle  ← méthode qui marche partout
+#  Puis VÉRIFICATION réelle que le port 7300 écoute.
+#
+#  udp-custom : optionnel, nécessite un binaire hébergé.
+# ============================================================
+source /etc/nvpanel/lib/ui.sh
+[ "$EUID" -ne 0 ] && { err "Lance en root."; exit 1; }
+
+REPO_RAW="https://raw.githubusercontent.com/Boblevel/auto-scriptV3/main"
+DIR=/etc/nvpanel/udp
+mkdir -p "$DIR"
+umask 077
+AUTO=0; [ "$1" = "auto" ] && AUTO=1
+
+
+case "$(uname -m)" in
+  aarch64|arm64) UDPC_SRC="udp-custom-arm64"; ELF_MACHINE="b700" ;;
+  x86_64|amd64)  UDPC_SRC="udp-custom";       ELF_MACHINE="3e00" ;;
+  *) [ "$AUTO" = 0 ] && err "Architecture non supportée : $(uname -m)."; exit 1 ;;
+esac
+
+# vrai binaire exécutable ? (évite qu'une page « 404 » soit prise pour un binaire)
+is_bin(){
+  [ -s "$1" ] || return 1
+  local sig; sig=$(head -c 4 "$1" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+  [ "$sig" = "7f454c46" ] \
+    && [ "$(od -An -j18 -N2 -tx1 "$1" 2>/dev/null | tr -d ' \n')" = "$ELF_MACHINE" ]
+}
+badvpn_runnable(){
+  is_bin "$1" || return 1
+  timeout 5 "$1" --help >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -lt 124 ]
+}
+
+# ---------- mode « build » : fabriquer le binaire à héberger ----------
+# Usage : install-udp build
+# Compile un badvpn-udpgw STATIQUE (indépendant de la version de la
+# distribution) et le dépose dans /root/ pour que tu l'uploades sur GitHub.
+if [ "$1" = "build" ]; then
+  banner; center " FABRICATION DU BINAIRE UDP " "${BOLD}${WHT}"; line
+  printf "${CYN}➜${NC} Installation des outils de compilation…\n"
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y cmake make gcc build-essential curl >/dev/null 2>&1
+  SRC=$(mktemp -d /tmp/nvpanel-badvpn-build.XXXXXX) || { err "Dossier temporaire impossible."; pause; exit 1; }
+  printf "${CYN}➜${NC} Téléchargement de la source officielle…\n"
+  if ! curl -fsSL "https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz" -o "$SRC/b.tar.gz" 2>/dev/null; then
+    err "Téléchargement impossible."; pause; exit 1
+  fi
+  tar xzf "$SRC/b.tar.gz" -C "$SRC" 2>/dev/null
+  BD=$(find "$SRC" -mindepth 1 -maxdepth 1 -type d -name 'badvpn-*' | head -1)
+  [ -z "$BD" ] && { err "Archive illisible."; pause; exit 1; }
+  printf "${CYN}➜${NC} Compilation statique (2 à 4 minutes)…\n"
+  mkdir -p "$SRC/out"; cd "$SRC/out" || exit 1
+  cmake "$BD" -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="-fcommon -w" \
+    -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 \
+    -DCMAKE_EXE_LINKER_FLAGS="-static" >/dev/null 2>&1
+  make -j"$(nproc 2>/dev/null || echo 1)" >/dev/null 2>&1
+  OUT=$(find "$SRC/out" -type f -name 'badvpn-udpgw' 2>/dev/null | head -1)
+  # si le statique échoue, on retente en dynamique
+  if [ -z "$OUT" ]; then
+    printf "${YLW}!${NC} Statique impossible, compilation classique…\n"
+    rm -rf "$SRC/out"; mkdir -p "$SRC/out"; cd "$SRC/out" || exit 1
+    cmake "$BD" -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS="-fcommon -w" \
+      -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
+    make -j"$(nproc 2>/dev/null || echo 1)" >/dev/null 2>&1
+    OUT=$(find "$SRC/out" -type f -name 'badvpn-udpgw' 2>/dev/null | head -1)
+  fi
+  cd / || true
+  if [ -n "$OUT" ] && is_bin "$OUT"; then
+    case "$(uname -m)" in
+      aarch64|arm64) DEST=/root/badvpn-udpgw-arm64 ;;
+      *)             DEST=/root/badvpn-udpgw ;;
+    esac
+    install -m755 "$OUT" "$DEST"
+    rm -rf "$SRC"
+    clear; banner; center " ✔  BINAIRE PRÊT " "${BOLD}${GRN}"; line
+    ok "Fichier créé : ${WHT}$DEST${NC}"
+    printf "   ${GRY}Taille : %s${NC}\n\n" "$(du -h "$DEST" | cut -f1)"
+    printf "   ${WHT}À faire maintenant :${NC}\n"
+    printf "   ${GRY}1. Récupère ce fichier (Termius → SFTP → /root/)${NC}\n"
+    printf "   ${GRY}2. Uploade-le à la racine de ton dépôt GitHub${NC}\n"
+    printf "   ${GRY}   sous le nom :${NC} ${WHT}%s${NC}\n" "$(basename "$DEST")"
+    printf "   ${GRY}3. Ensuite l'UDP s'installera tout seul chez tous tes clients,${NC}\n"
+    printf "   ${GRY}   exactement comme SlowDNS.${NC}\n"
+  else
+    rm -rf "$SRC"
+    err "La compilation a échoué (RAM insuffisante ?)."
+    printf "   ${GRY}Essaie sur un VPS avec au moins 1 Go de RAM.${NC}\n"
+  fi
+  pause; exit 0
+fi
+
+[ "$AUTO" = 1 ] || { banner; center " INSTALLATION UDP " "${BOLD}${WHT}"; line; }
+
+# ---------- 1) badvpn-udpgw ---------------------------------
+[ "$AUTO" = 1 ] || printf "${CYN}➜${NC} Installation de badvpn-udpgw…\n"
+BADVPN=""
+BADVPN_OLD=""
+BADVPN_REPLACED=0
+export DEBIAN_FRONTEND=noninteractive
+
+# a) BINAIRE HÉBERGÉ DANS TON DÉPÔT — méthode principale, comme SlowDNS.
+#    Même fichier pour tous tes clients : instantané et prévisible.
+case "$(uname -m)" in
+  aarch64|arm64) BSRC="badvpn-udpgw-arm64" ;;
+  x86_64|amd64)  BSRC="badvpn-udpgw" ;;
+esac
+_bad_tmp=$(mktemp "$DIR/.badvpn-udpgw.XXXXXX") || _bad_tmp=""
+if [ -n "$_bad_tmp" ]; then
+  curl -fsSL --connect-timeout 15 --max-time 120 "$REPO_RAW/$BSRC" -o "$_bad_tmp" 2>/dev/null || true
+fi
+if [ -n "$_bad_tmp" ] && is_bin "$_bad_tmp"; then
+  chmod 700 "$_bad_tmp"
+  if badvpn_runnable "$_bad_tmp"; then
+    _bad_replace=1
+    if is_bin "$DIR/badvpn-udpgw"; then
+      chmod 700 "$DIR/badvpn-udpgw" 2>/dev/null
+    fi
+    if badvpn_runnable "$DIR/badvpn-udpgw"; then
+      BADVPN_OLD=$(mktemp "$DIR/.badvpn-udpgw.old.XXXXXX") || BADVPN_OLD=""
+      if [ -z "$BADVPN_OLD" ] || ! cp -a "$DIR/badvpn-udpgw" "$BADVPN_OLD" 2>/dev/null; then
+        [ -z "$BADVPN_OLD" ] || rm -f "$BADVPN_OLD"
+        BADVPN_OLD=""; _bad_replace=0
+      fi
+    fi
+    if [ "$_bad_replace" = 1 ] && mv "$_bad_tmp" "$DIR/badvpn-udpgw"; then
+      BADVPN="$DIR/badvpn-udpgw"; BADVPN_REPLACED=1
+    fi
+  fi
+fi
+[ -z "$_bad_tmp" ] || rm -f "$_bad_tmp"
+if [ -z "$BADVPN" ] && is_bin "$DIR/badvpn-udpgw"; then
+  chmod 700 "$DIR/badvpn-udpgw" 2>/dev/null
+  badvpn_runnable "$DIR/badvpn-udpgw" && BADVPN="$DIR/badvpn-udpgw"
+fi
+
+# b) secours : paquet de la distribution (n'existe pas partout)
+if [ -z "$BADVPN" ]; then
+  command -v badvpn-udpgw >/dev/null 2>&1 || { apt-get update -y >/dev/null 2>&1; apt-get install -y badvpn >/dev/null 2>&1; }
+  _bad_pkg=$(command -v badvpn-udpgw 2>/dev/null)
+  [ -n "$_bad_pkg" ] && badvpn_runnable "$_bad_pkg" && BADVPN="$_bad_pkg"
+fi
+
+# c) DERNIER RECOURS : compilation depuis la source officielle.
+#    C'est la méthode la plus fiable : elle fonctionne sur n'importe quel
+#    VPS Debian/Ubuntu, en x86_64 comme en ARM, sans dépendre d'un dépôt.
+if [ -z "$BADVPN" ]; then
+  [ "$AUTO" = 1 ] || printf "${CYN}➜${NC} Préparation du module UDP (2 à 5 minutes)…\n"
+  LOG=/etc/nvpanel/udp/build.log   # journal interne (jamais affiché au client)
+  : > "$LOG" 2>/dev/null
+  apt-get update -y >>"$LOG" 2>&1
+  apt-get install -y cmake make gcc g++ build-essential pkg-config >>"$LOG" 2>&1
+
+  # Un peu d'espace mémoire temporaire si le VPS est juste (évite l'échec silencieux)
+  SWAPTMP=""
+  MEMMB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+  if [ -n "$MEMMB" ] && [ "$MEMMB" -lt 1200 ] && [ ! -f /swapfile ]; then
+    _swap_candidate=$(mktemp /tmp/nvpanel-swap.XXXXXX) || _swap_candidate=""
+    if [ -n "$_swap_candidate" ] \
+       && { fallocate -l 512M "$_swap_candidate" >>"$LOG" 2>&1 \
+            || dd if=/dev/zero of="$_swap_candidate" bs=1M count=512 status=none >>"$LOG" 2>&1; }; then
+      chmod 600 "$_swap_candidate"; mkswap "$_swap_candidate" >>"$LOG" 2>&1
+      if swapon "$_swap_candidate" >>"$LOG" 2>&1; then SWAPTMP="$_swap_candidate"; else rm -f "$_swap_candidate"; fi
+    else
+      [ -z "$_swap_candidate" ] || rm -f "$_swap_candidate"
+    fi
+  fi
+
+  SRC=$(mktemp -d /tmp/nvpanel-badvpn-src.XXXXXX) || SRC=""
+  GOT=0
+  if [ -n "$SRC" ]; then
+    for U in "https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz" \
+             "https://codeload.github.com/ambrop72/badvpn/tar.gz/refs/tags/1.999.130"; do
+      if curl -fsSL --max-time 120 "$U" -o "$SRC/badvpn.tar.gz" >>"$LOG" 2>&1 \
+         && tar xzf "$SRC/badvpn.tar.gz" -C "$SRC" >>"$LOG" 2>&1; then GOT=1; break; fi
+    done
+  fi
+
+  if [ "$GOT" = 1 ]; then
+    BSRCDIR=$(find "$SRC" -mindepth 1 -maxdepth 1 -type d -name 'badvpn-*' | head -1)
+    if [ -n "$BSRCDIR" ]; then
+      mkdir -p "$SRC/build"
+      ( cd "$SRC/build" && \
+        cmake "$BSRCDIR" -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_FLAGS="-fcommon -w" \
+          -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >>"$LOG" 2>&1 && \
+        make -j1 >>"$LOG" 2>&1 )
+      COMPILED=$(find "$SRC/build" -type f -name 'badvpn-udpgw' 2>/dev/null | head -1)
+      # 2e tentative avec l'ancienne orthographe des options
+      if [ -z "$COMPILED" ]; then
+        rm -rf "$SRC/build"; mkdir -p "$SRC/build"
+        ( cd "$SRC/build" && \
+          cmake "$BSRCDIR" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-fcommon -w" \
+            -DBUILDNOTHINGBYDEFAULT=1 -DBUILDUDPGW=1 >>"$LOG" 2>&1 && \
+          make -j1 >>"$LOG" 2>&1 )
+        COMPILED=$(find "$SRC/build" -type f -name 'badvpn-udpgw' 2>/dev/null | head -1)
+      fi
+      if [ -n "$COMPILED" ] && is_bin "$COMPILED"; then
+        install -m755 "$COMPILED" /usr/local/bin/badvpn-udpgw 2>/dev/null
+        badvpn_runnable /usr/local/bin/badvpn-udpgw && BADVPN=/usr/local/bin/badvpn-udpgw
+      fi
+    fi
+  fi
+  [ -z "$SRC" ] || rm -rf "$SRC"
+  [ -n "$SWAPTMP" ] && { swapoff "$SWAPTMP" 2>/dev/null; rm -f "$SWAPTMP"; }
+fi
+
+UDPGW_OK=0
+if [ -n "$BADVPN" ]; then
+  for p in 7100 7200 7300; do
+    cat > /etc/systemd/system/nvpanel-badvpn-$p.service <<EOF
+[Unit]
+Description=RHAFF SERVICE badvpn-udpgw $p
+After=network.target
+[Service]
+ExecStart=$BADVPN --listen-addr 127.0.0.1:$p --max-clients 500 --max-connections-for-client 10
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  done
+  systemctl daemon-reload >/dev/null 2>&1
+  for p in 7100 7200 7300; do
+    systemctl enable nvpanel-badvpn-$p >/dev/null 2>&1
+    systemctl restart nvpanel-badvpn-$p >/dev/null 2>&1
+  done
+  sleep 1
+fi
+
+# preuve réelle : le port 7300 écoute-t-il vraiment ?
+_check_badvpn(){
+  UDPGW_OK=0; LISTEN_OK=0
+  for p in 7100 7200 7300; do
+    systemctl is-active --quiet nvpanel-badvpn-$p && UDPGW_OK=$((UDPGW_OK+1))
+  done
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lnt "sport = :7300" 2>/dev/null | awk '$4=="127.0.0.1:7300"{f=1} END{exit f?0:1}' && LISTEN_OK=1
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | awk '$4=="127.0.0.1:7300"{f=1} END{exit f?0:1}' && LISTEN_OK=1
+  fi
+}
+_check_badvpn
+if { [ "$UDPGW_OK" -ne 3 ] || [ "$LISTEN_OK" -ne 1 ]; } \
+   && [ "$BADVPN_REPLACED" = 1 ] && [ -n "$BADVPN_OLD" ]; then
+  if mv "$BADVPN_OLD" "$DIR/badvpn-udpgw" 2>/dev/null; then
+    BADVPN_OLD=""
+    for p in 7100 7200 7300; do systemctl restart nvpanel-badvpn-$p >/dev/null 2>&1; done
+    sleep 1
+    _check_badvpn
+  fi
+fi
+[ -z "$BADVPN_OLD" ] || rm -f "$BADVPN_OLD"
+
+# ---------- 2) udp-custom (optionnel) -----------------------
+[ "$AUTO" = 1 ] || printf "${CYN}➜${NC} udp-custom (optionnel)…\n"
+UDPC_OK=0
+UDPC_MIGRATED=0
+UDPC_LISTEN_PORT=22
+UDPC_PANEL_RULE=0
+[ -f /etc/systemd/system/nvpanel-udp-custom.service ] && UDPC_PANEL_RULE=1
+UDPC_WAS_ACTIVE=0; systemctl is-active --quiet nvpanel-udp-custom 2>/dev/null && UDPC_WAS_ACTIVE=1
+UDPC_WAS_ENABLED=0; systemctl is-enabled --quiet nvpanel-udp-custom 2>/dev/null && UDPC_WAS_ENABLED=1
+UDPC_BIN_HAD=0; is_bin "$DIR/udp-custom" && UDPC_BIN_HAD=1
+UDPC_CONFIG_HAD=0; [ -f "$DIR/config.json" ] && UDPC_CONFIG_HAD=1
+UDPC_CAN_CHANGE=1
+UDPC_UNIT_OLD=""; UDPC_CONFIG_OLD=""
+if [ "$UDPC_PANEL_RULE" = 1 ]; then
+  UDPC_UNIT_OLD=$(mktemp "$DIR/.udp-custom.service.old.XXXXXX") || UDPC_UNIT_OLD=""
+  [ -n "$UDPC_UNIT_OLD" ] && cp -a /etc/systemd/system/nvpanel-udp-custom.service "$UDPC_UNIT_OLD" 2>/dev/null \
+    || UDPC_CAN_CHANGE=0
+fi
+if [ "$UDPC_CONFIG_HAD" = 1 ]; then
+  UDPC_CONFIG_OLD=$(mktemp "$DIR/.config.json.old.XXXXXX") || UDPC_CONFIG_OLD=""
+  [ -n "$UDPC_CONFIG_OLD" ] && cp -a "$DIR/config.json" "$UDPC_CONFIG_OLD" 2>/dev/null \
+    || UDPC_CAN_CHANGE=0
+fi
+UDPC_OLD=""
+_udpc_tmp=$(mktemp "$DIR/.udp-custom.XXXXXX") || _udpc_tmp=""
+if [ -n "$_udpc_tmp" ]; then
+  curl -fsSL --connect-timeout 15 --max-time 120 "$REPO_RAW/$UDPC_SRC" -o "$_udpc_tmp" 2>/dev/null || true
+fi
+if [ "$UDPC_CAN_CHANGE" = 1 ] && [ -n "$_udpc_tmp" ] && is_bin "$_udpc_tmp" \
+   && timeout 5 "$_udpc_tmp" --help >/dev/null 2>&1; then
+  _udpc_replace=1
+  if is_bin "$DIR/udp-custom"; then
+    UDPC_OLD=$(mktemp "$DIR/.udp-custom.old.XXXXXX") || UDPC_OLD=""
+    if [ -z "$UDPC_OLD" ] || ! cp -a "$DIR/udp-custom" "$UDPC_OLD" 2>/dev/null; then
+      [ -z "$UDPC_OLD" ] || rm -f "$UDPC_OLD"
+      UDPC_OLD=""; _udpc_replace=0
+    fi
+  fi
+  if [ "$_udpc_replace" = 1 ]; then
+    chmod 700 "$_udpc_tmp" && mv "$_udpc_tmp" "$DIR/udp-custom" || true
+  fi
+fi
+[ -z "$_udpc_tmp" ] || rm -f "$_udpc_tmp"
+if [ "$UDPC_CAN_CHANGE" != 1 ]; then
+  UDPC_LISTEN_PORT=$(grep -oP '"listen"\s*:\s*":?\K[0-9]+' "$DIR/config.json" 2>/dev/null | head -1)
+  UDPC_LISTEN_PORT=${UDPC_LISTEN_PORT:-22}
+  if [ "$UDPC_WAS_ACTIVE" = 1 ] \
+     && ss -H -lun "sport = :$UDPC_LISTEN_PORT" 2>/dev/null | grep -q .; then
+    UDPC_OK=1
+  fi
+elif is_bin "$DIR/udp-custom"; then
+  chmod 700 "$DIR/udp-custom"
+  # Écoute sur le port UDP 22, et non plus 36712.
+  # UDP et TCP sont deux espaces de ports distincts : le 22 en UDP est libre
+  # même si SSH occupe le 22 en TCP. Le client saisit donc le MÊME port pour
+  # SSH, SlowDns et UDP Custom — il lui suffit de cocher ou décocher la case,
+  # sans jamais retoucher au port, source d'erreur fréquente.
+  if [ -f "$DIR/config.json" ]; then
+    # installation antérieure : on bascule le port sans toucher au reste
+    sed -i 's/":36712"/":22"/' "$DIR/config.json" 2>/dev/null
+  else
+    cat > "$DIR/config.json" <<'EOF'
+{ "listen": ":22", "stream_buffer": 33554432, "receive_buffer": 83886080, "auth": { "mode": "passwords" } }
+EOF
+  fi
+  cat > /etc/systemd/system/nvpanel-udp-custom.service <<EOF
+[Unit]
+Description=RHAFF SERVICE udp-custom
+After=network.target
+[Service]
+WorkingDirectory=$DIR
+ExecStart=$DIR/udp-custom server -exclude 1-21,23-52,54-79
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable nvpanel-udp-custom >/dev/null 2>&1
+  systemctl restart nvpanel-udp-custom >/dev/null 2>&1
+  sleep 1
+  if systemctl is-active --quiet nvpanel-udp-custom \
+     && ss -H -lun "sport = :22" 2>/dev/null | grep -q .; then
+    UDPC_OK=1; UDPC_MIGRATED=1; UDPC_LISTEN_PORT=22
+  else
+    systemctl disable --now nvpanel-udp-custom >/dev/null 2>&1
+    if [ -n "$UDPC_OLD" ] && mv "$UDPC_OLD" "$DIR/udp-custom" 2>/dev/null; then
+      UDPC_OLD=""
+    elif [ "$UDPC_BIN_HAD" != 1 ]; then
+      rm -f "$DIR/udp-custom"
+    fi
+    if [ "$UDPC_PANEL_RULE" = 1 ] && [ -n "$UDPC_UNIT_OLD" ]; then
+      mv "$UDPC_UNIT_OLD" /etc/systemd/system/nvpanel-udp-custom.service 2>/dev/null && UDPC_UNIT_OLD=""
+    elif [ "$UDPC_PANEL_RULE" != 1 ]; then
+      rm -f /etc/systemd/system/nvpanel-udp-custom.service
+    fi
+    if [ "$UDPC_CONFIG_HAD" = 1 ] && [ -n "$UDPC_CONFIG_OLD" ]; then
+      mv "$UDPC_CONFIG_OLD" "$DIR/config.json" 2>/dev/null && UDPC_CONFIG_OLD=""
+    elif [ "$UDPC_CONFIG_HAD" != 1 ]; then
+      rm -f "$DIR/config.json"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1
+    if [ "$UDPC_WAS_ACTIVE" = 1 ]; then
+      if [ "$UDPC_WAS_ENABLED" = 1 ]; then systemctl enable nvpanel-udp-custom >/dev/null 2>&1
+      else systemctl disable nvpanel-udp-custom >/dev/null 2>&1; fi
+      systemctl start nvpanel-udp-custom >/dev/null 2>&1
+      sleep 1
+      UDPC_LISTEN_PORT=$(grep -oP '"listen"\s*:\s*":?\K[0-9]+' "$DIR/config.json" 2>/dev/null | head -1)
+      UDPC_LISTEN_PORT=${UDPC_LISTEN_PORT:-22}
+      if systemctl is-active --quiet nvpanel-udp-custom \
+         && ss -H -lun "sport = :$UDPC_LISTEN_PORT" 2>/dev/null | grep -q .; then
+        UDPC_OK=1
+      fi
+    fi
+    if [ "$UDPC_OK" != 1 ] && [ "$UDPC_PANEL_RULE" != 1 ]; then
+      systemctl disable --now nvpanel-udp-custom >/dev/null 2>&1
+      rm -f /etc/systemd/system/nvpanel-udp-custom.service
+      systemctl daemon-reload >/dev/null 2>&1
+    fi
+  fi
+else
+  systemctl disable --now nvpanel-udp-custom >/dev/null 2>&1
+  rm -f "$DIR/udp-custom"
+fi
+[ -z "$UDPC_OLD" ] || rm -f "$UDPC_OLD"
+[ -z "$UDPC_UNIT_OLD" ] || rm -f "$UDPC_UNIT_OLD"
+[ -z "$UDPC_CONFIG_OLD" ] || rm -f "$UDPC_CONFIG_OLD"
+
+# ---------- 3) pare-feu : autoriser l'UDP -------------------
+if command -v iptables >/dev/null 2>&1; then
+  if [ "$UDPC_MIGRATED" = 1 ]; then
+    # le port d'écoute est désormais l'UDP 22 : on retire l'ancienne règle
+    iptables -D INPUT -p udp --dport 36712 -j ACCEPT 2>/dev/null
+    iptables -C INPUT -p udp --dport 22 -j ACCEPT 2>/dev/null || \
+      iptables -I INPUT -p udp --dport 22 -j ACCEPT 2>/dev/null
+  fi
+fi
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+  [ "$UDPC_MIGRATED" = 1 ] && ufw allow 22/udp >/dev/null 2>&1
+fi
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save >/dev/null 2>&1
+fi
+
+# le compteur de conso doit connaître les nouveaux ports
+[ -x /usr/local/bin/nvpanel-conso ] && /usr/local/bin/nvpanel-conso setup >/dev/null 2>&1
+
+# ---------- 4) rapport honnête ------------------------------
+if [ "$AUTO" = 1 ]; then
+  if [ "$UDPGW_OK" -eq 3 ] && [ "$LISTEN_OK" -eq 1 ]; then
+    printf "  ${GRN}✔${NC} UDP (UDPGW) actif.\n"; exit 0
+  fi
+  printf "  ${YLW}!${NC} UDP non activé.\n"; exit 1
+fi
+
+clear; banner
+if [ "$LISTEN_OK" = 1 ]; then
+  center " ✔  UDP OPÉRATIONNEL " "${BOLD}${GRN}"; line
+  ok "UDPGW écoute bien sur 127.0.0.1:7300 (services actifs : $UDPGW_OK/3)"
+  printf "   ${GRY}Vérifié en direct : le port répond, la connexion UDP passera.${NC}\n\n"
+  printf "   ${WHT}Côté application cliente :${NC}\n"
+  printf "   ${GRY}• Active « UDPGW » (ou « Payload UDP »)${NC}\n"
+  printf "   ${GRY}• Adresse à saisir :${NC} ${WHT}127.0.0.1:7300${NC}\n"
+  printf "   ${GRY}• L'UDP passe DANS le tunnel SSH : il faut être connecté en SSH.${NC}\n"
+elif [ "$UDPGW_OK" -gt 0 ]; then
+  center " ⚠  UDP PARTIEL " "${BOLD}${YLW}"; line
+  warn "Les services sont lancés mais le port 7300 ne répond pas encore."
+  printf "   ${GRY}Attends quelques secondes puis relance ce menu pour revérifier.${NC}\n"
+else
+  center " ✘  UDP NON ACTIVÉ " "${BOLD}${RED}"; line
+  err "Le module UDP n'a pas pu être activé sur ce serveur."
+  printf "   ${GRY}Vérifie que le serveur a accès à Internet, puis réessaie.${NC}\n"
+  printf "   ${GRY}Relance ensuite : menu → 01 → UDP → 1${NC}\n"
+fi
+echo
+if [ "$UDPC_OK" = 1 ]; then
+  ok "udp-custom actif (port $UDPC_LISTEN_PORT en UDP)"
+else
+  printf "   ${GRY}udp-custom : non disponible sur ce serveur.${NC}\n"
+  printf "   ${GRY}Ce module est facultatif : l'UDP fonctionne sans lui.${NC}\n"
+fi
+pause

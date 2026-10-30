@@ -1,0 +1,134 @@
+#!/bin/bash
+# ============================================================
+#  nvpanel · nettoyage automatique des comptes expirés
+#  (appelé par cron) — SSH + Xray/SS + PPP + Hysteria
+# ============================================================
+umask 077
+exec 7>/run/nvpanel-clean.lock
+flock -n 7 || exit 0
+
+log_lock_result(){
+  local proto="$1" user="$2" result="$3"
+  printf '%s|%s|%s|%s\n' "$(date '+%F %T')" "$proto" "$user" "$result" >> /var/log/nvpanel-expire-lock.log 2>/dev/null || true
+}
+
+# --- Comptes SSH --------------------------------------------
+# Un compte SSH expiré (date passée sur "useradd -e") est DÉJÀ bloqué par le
+# système lui-même : aucune connexion possible, sans le moindre code de
+# notre part. Il n'y a donc plus de raison de le supprimer automatiquement.
+# On laisse la fiche visible dans le panel : l'admin voit le compte, son
+# état, et choisit lui-même de le prolonger ou de le supprimer — plus de
+# disparition silencieuse d'un compte qu'il n'a pas explicitement retiré.
+# La purge reste disponible à la demande via le menu « Nettoyage des
+# comptes » (nvpanel-cli purge ssh expired), simplement plus en automatique.
+
+# --- Clients Xray / Shadowsocks -----------------------------
+# À la différence de SSH, Xray n'a aucun mécanisme natif d'expiration : sans
+# action de notre part, un client expiré continuerait de se connecter
+# normalement. On ne supprime donc plus la fiche — on la VERROUILLE (retrait
+# du client de la config Xray active + marquage "L" en base), exactement
+# comme le fait déjà le verrouillage manuel (menu Verrouiller). Le client ne
+# peut plus se connecter, mais la fiche reste visible : l'admin la prolonge
+# ou la supprime lui-même, plus de disparition automatique.
+purge_proto() {
+  local proto="$1" db="$2" today
+  [ -f "$db" ] || return
+  [ -x /usr/local/bin/nvpanel-cli ] || return
+  today=$(date +%F)
+  while read -r _ name uuid exp fl; do
+    [ -z "$name" ] && continue
+    [ "$fl" = "L" ] && continue
+    # Comparaison de DATES, pas d'horodatages. Avec « date -d "$exp" +%s » on
+    # obtenait minuit du jour d'expiration : le compte était donc verrouillé
+    # dès 00h00 CE jour-là, alors qu'il devait rester valable jusqu'à sa fin.
+    case "$exp" in ''|*[!0-9-]*) continue ;; esac
+    if [ "$exp" \< "$today" ] || [ "$exp" = "$today" ]; then
+      if /usr/local/bin/nvpanel-cli xlock "$proto" "$name" >/dev/null 2>&1; then log_lock_result "$proto" "$name" OK; else log_lock_result "$proto" "$name" FAIL; fi
+    fi
+  done < "$db"
+}
+
+purge_proto vmess  /etc/nvpanel/db/vmess
+purge_proto vless  /etc/nvpanel/db/vless
+purge_proto trojan /etc/nvpanel/db/trojan
+purge_proto ss     /etc/nvpanel/db/shadowsocks
+
+# --- Comptes L2TP / PPTP / SSTP -----------------------------
+# Comme Xray, chap-secrets ne gère aucune expiration native : sans action de
+# notre part, un compte expiré continuerait de fonctionner. On verrouille
+# donc chaque compte expiré individuellement (commente sa ligne dans
+# chap-secrets + marque "L" en base, exactement comme le verrouillage
+# manuel) au lieu de purger — la fiche reste visible, l'admin décide lui-même
+# de prolonger ou de supprimer.
+today=$(date +%F)
+for p in l2tp pptp sstp; do
+  db="/etc/nvpanel/db/$p"
+  [ -f "$db" ] || continue
+  [ -x /usr/local/bin/nvpanel-ppp ] || continue
+  while read -r _ user pass exp fl; do
+    [ -z "$user" ] && continue
+    [ "$fl" = "L" ] && continue
+    case "$exp" in ''|*[!0-9-]*) continue ;; esac
+    { [ "$exp" \< "$today" ] || [ "$exp" = "$today" ]; } && if /usr/local/bin/nvpanel-ppp lock "$p" "$user" >/dev/null 2>&1; then log_lock_result "$p" "$user" OK; else log_lock_result "$p" "$user" FAIL; fi
+  done < "$db"
+done
+
+# --- Comptes Hysteria2 --------------------------------------
+db=/etc/nvpanel/db/hysteria
+if [ -f "$db" ] && [ -x /usr/local/bin/nvpanel-hysteria ]; then
+  while read -r _ user _ exp fl; do
+    [ -n "$user" ] || continue
+    [ "$fl" = "L" ] && continue
+    case "$exp" in ''|*[!0-9-]*) continue ;; esac
+    { [ "$exp" \< "$today" ] || [ "$exp" = "$today" ]; } \
+      && /usr/local/bin/nvpanel-hysteria lock "$user" >/dev/null 2>&1
+  done < "$db"
+fi
+
+# --- Clients WireGuard --------------------------------------
+# WireGuard ne connaît pas les dates d'expiration. Le peer est retiré de la
+# configuration active mais sa fiche et sa configuration client sont gardées,
+# afin qu'une prolongation puisse le réactiver sans changer ses clés.
+WGDB=/etc/nvpanel/db/wireguard
+WGCONF=/etc/wireguard/wg0.conf
+if [ -f "$WGDB" ] && [ -f "$WGCONF" ] && command -v flock >/dev/null 2>&1; then
+  (
+    flock -w 20 8 || exit 0
+    while read -r _ name pub ip exp fl; do
+      [ -n "$name" ] && [ -n "$pub" ] || continue
+      [ "$fl" = "L" ] && continue
+      case "$exp" in ''|*[!0-9-]*) continue ;; esac
+      if [ "$exp" \< "$today" ] || [ "$exp" = "$today" ]; then
+        had_runtime=0
+        wg show wg0 peers 2>/dev/null | grep -Fxq "$pub" && had_runtime=1
+        tmp=$(mktemp /etc/wireguard/.wg0.conf.XXXXXX) || continue
+        backup=$(mktemp /etc/wireguard/.wg0.conf.backup.XXXXXX) || { rm -f "$tmp"; continue; }
+        cp -a "$WGCONF" "$backup" 2>/dev/null || { rm -f "$tmp" "$backup"; continue; }
+        awk -v n="$name" '
+          function flush(){ if (buf!="" && !drop) printf "%s",buf; buf=""; drop=0 }
+          /^\[Peer\]$/ { flush(); peer=1; buf=$0 ORS; next }
+          { if (peer) { buf=buf $0 ORS; if ($0=="# " n) drop=1 } else print }
+          END { flush() }
+        ' "$WGCONF" > "$tmp" || { rm -f "$tmp" "$backup"; continue; }
+        chmod 600 "$tmp" 2>/dev/null
+        mv "$tmp" "$WGCONF" || { rm -f "$tmp" "$backup"; continue; }
+        if [ "$had_runtime" = 1 ] && ! wg set wg0 peer "$pub" remove >/dev/null 2>&1; then
+          mv "$backup" "$WGCONF" 2>/dev/null || rm -f "$backup"
+          continue
+        fi
+        dbtmp=$(mktemp "${WGDB}.XXXXXX") || dbtmp=""
+        if [ -n "$dbtmp" ] \
+           && awk -v n="$name" '{if($1=="###"&&$2==n){print $1,$2,$3,$4,$5,"L"}else print}' "$WGDB" > "$dbtmp" \
+           && chmod 600 "$dbtmp" && mv "$dbtmp" "$WGDB"; then
+          rm -f "$backup"
+        else
+          [ -n "$dbtmp" ] && rm -f "$dbtmp"
+          mv "$backup" "$WGCONF" 2>/dev/null || rm -f "$backup"
+          [ "$had_runtime" = 1 ] && wg set wg0 peer "$pub" allowed-ips "$ip/32" >/dev/null 2>&1 || true
+        fi
+      fi
+    done < "$WGDB"
+  ) 8>/run/nvpanel-wg.lock
+fi
+
+exit 0

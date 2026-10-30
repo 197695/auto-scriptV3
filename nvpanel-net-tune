@@ -1,0 +1,150 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · réglage réseau ciblé
+#  - buffers UDP mesurés insuffisants
+#  - RPS/RFS uniquement sur NIC mono-file
+#  Ne touche ni au MTU, ni à BBR/fq, ni aux protocoles.
+# ============================================================
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+SYSCTL_FILE=/etc/sysctl.d/99-nvpanel-network.conf
+UNIT_FILE=/etc/systemd/system/nvpanel-net-tune.service
+RPS_ENTRIES=32768
+RBUF_DEFAULT=1048576
+RBUF_MAX=16777216
+UDP_RMEM_MIN=16384
+
+[ "${EUID:-$(id -u)}" -eq 0 ] || exit 1
+
+_default_iface(){
+  ip -4 route show default 2>/dev/null | awk '$1=="default"{print $5; exit}'
+}
+
+_cpu_mask_without_cpu0(){
+  local n="$1"
+  python3 - "$n" <<'PY'
+import sys
+n = int(sys.argv[1])
+if n <= 1:
+    print("0")
+    raise SystemExit
+mask = sum(1 << i for i in range(1, n))
+parts = []
+while mask:
+    parts.append(f"{mask & 0xffffffff:08x}")
+    mask >>= 32
+parts.reverse()
+parts[0] = parts[0].lstrip("0") or "0"
+print(",".join(parts))
+PY
+}
+
+_write_config(){
+  local tmp
+  mkdir -p /etc/sysctl.d /etc/systemd/system || return 1
+  tmp=$(mktemp /etc/sysctl.d/.nvpanel-network.XXXXXX) || return 1
+  cat > "$tmp" <<EOF_SYSCTL
+# RHAFF SERVICE - réglages réseau validés sur charge réelle
+# Seuls les paramètres acceptés par ce noyau sont enregistrés.
+EOF_SYSCTL
+  printf '%s' "$_SYSCTL_APPLIED" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 644 "$tmp" && mv -f "$tmp" "$SYSCTL_FILE" || { rm -f "$tmp"; return 1; }
+
+  cat > "$UNIT_FILE" <<'EOF_UNIT'
+[Unit]
+Description=RHAFF SERVICE - optimisation réception réseau
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nvpanel-net-tune apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+  chmod 644 "$UNIT_FILE" || return 1
+}
+
+_apply_sysctl(){
+  # Un VPS peut exposer des paramètres en lecture seule ou sans permission
+  # d'écriture (LXC, noyau hébergeur...). Ne pas bloquer le panel pour une
+  # optimisation facultative, et ne pas la rendre persistante si refusée.
+  local key value path current
+  _SYSCTL_APPLIED=""
+  while read -r key value; do
+    [ -n "$key" ] || continue
+    path="/proc/sys/${key//./\/}"
+    current=$(sysctl -n "$key" 2>/dev/null)
+    # Une valeur existante supérieure à la cible peut être un réglage de
+    # l'hébergeur : ne pas la diminuer ni la remplacer au prochain démarrage.
+    if [[ "$current" =~ ^[0-9]+$ ]] && [ "$current" -gt "$value" ]; then
+      printf 'RHAFF réseau : %s déjà supérieur à la cible ; conservé.\n' "$key" >&2
+      continue
+    fi
+    if [ -e "$path" ] && sysctl -w "$key=$value" >/dev/null 2>&1; then
+      _SYSCTL_APPLIED+="$key = $value"$'\n'
+    else
+      printf 'RHAFF réseau : %s non autorisé par le noyau ; ignoré.\n' "$key" >&2
+    fi
+  done <<EOF_SYSCTL
+net.core.rmem_max $RBUF_MAX
+net.core.rmem_default $RBUF_DEFAULT
+net.ipv4.udp_rmem_min $UDP_RMEM_MIN
+net.core.rps_sock_flow_entries $RPS_ENTRIES
+EOF_SYSCTL
+}
+
+_apply_rps(){
+  local iface cpus mask q queues=()
+  iface=$(_default_iface)
+  [ -n "$iface" ] || return 0
+  [ -d "/sys/class/net/$iface/queues" ] || return 0
+
+  shopt -s nullglob
+  queues=(/sys/class/net/"$iface"/queues/rx-*)
+  shopt -u nullglob
+
+  # Une NIC multi-file possède déjà son parallélisme matériel (RSS). Le réglage
+  # est volontairement limité au cas diagnostiqué : une seule file RX.
+  [ "${#queues[@]}" -eq 1 ] || return 0
+  cpus=$(nproc 2>/dev/null || echo 1)
+  case "$cpus" in ''|*[!0-9]*) cpus=1 ;; esac
+  [ "$cpus" -gt 1 ] || return 0
+
+  mask=$(_cpu_mask_without_cpu0 "$cpus") || return 0
+  [ -n "$mask" ] && [ "$mask" != 0 ] || return 0
+
+  q="${queues[0]}"
+  [ -w "$q/rps_cpus" ] || { echo 'RHAFF réseau : RPS interdit sur cette interface ; ignoré.' >&2; return 0; }
+  printf '%s\n' "$mask" > "$q/rps_cpus" 2>/dev/null \
+    || { echo 'RHAFF réseau : écriture RPS refusée ; ignorée.' >&2; return 0; }
+  if [ -w "$q/rps_flow_cnt" ]; then
+    printf '%s\n' "$RPS_ENTRIES" > "$q/rps_flow_cnt" 2>/dev/null \
+      || echo 'RHAFF réseau : écriture RFS refusée ; ignorée.' >&2
+  fi
+}
+
+_apply(){
+  _apply_sysctl || return 1
+  _apply_rps || return 1
+}
+
+case "${1:-apply}" in
+  apply)
+    _apply
+    ;;
+  install)
+    _apply || exit 1
+    _write_config || exit 1
+    systemctl daemon-reload >/dev/null 2>&1 || exit 1
+    systemctl enable nvpanel-net-tune.service >/dev/null 2>&1 || exit 1
+    ;;
+  *)
+    echo "usage: nvpanel-net-tune apply|install" >&2
+    exit 2
+    ;;
+esac

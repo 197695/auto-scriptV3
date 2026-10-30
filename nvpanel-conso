@@ -1,0 +1,471 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · compteur de consommation CLIENTS
+#  Ne compte QUE le trafic des tunnels (comptes vendus).
+#  Le trafic propre du serveur (apt, mises à jour du script,
+#  test de vitesse, certbot...) n'est PAS compté.
+#
+#  Principe : trois chaînes iptables -w 3 qui ne comptent que
+#    - INPUT  : paquets ARRIVANT sur un port de service
+#    - OUTPUT : paquets PARTANT d'un port de service
+#    - FORWARD: paquets routés via WireGuard ou une interface PPP
+#  Un téléchargement fait par le serveur est OUTPUT vers le
+#  port 443 DISTANT (et non depuis notre port 443) : ignoré.
+# ============================================================
+# Les crons utilisateur Debian/Ubuntu peuvent démarrer avec un PATH réduit
+# (/usr/bin:/bin). iptables se trouve normalement dans /usr/sbin : sans ce
+# PATH explicite, `nvpanel-conso poll` lancé par cron quittait immédiatement
+# alors que la même commande fonctionnait depuis le shell root.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+DBDIR=/etc/nvpanel/db
+DB="$DBDIR/conso"
+umask 077
+# Version des règles de comptage. À incrémenter dès qu'on change ce qui est
+# compté. Une migration remet uniquement les compteurs bruts à zéro :
+# l'historique commercial déjà enregistré ne doit jamais être supprimé.
+RULES_VER=8
+VERF="$DBDIR/conso.ver"
+LASTF="$DBDIR/conso.last"   # derniers compteurs bruts lus
+CIN=NVCONSO_IN
+COUT=NVCONSO_OUT
+CFWD=NVCONSO_FWD
+CONSO_TAGS="ssh_bundle vmess vless trojan shadowsocks hysteria wg ppp"
+mkdir -p "$DBDIR"; touch "$DB"
+chmod 700 "$DBDIR" 2>/dev/null; chmod 600 "$DB" 2>/dev/null
+
+# Changement de méthode de comptage : on conserve l'historique et on repart
+# seulement de nouvelles références brutes. Le vidage de $DB effectué par les
+# anciennes versions supprimait toute la consommation lors d'une mise à jour.
+if [ "$(cat "$VERF" 2>/dev/null)" != "$RULES_VER" ]; then
+  rm -f "$LASTF" 2>/dev/null
+  for _tag in $CONSO_TAGS; do
+    rm -f "$DBDIR/.conso.last.$_tag" 2>/dev/null
+  done
+  # Les compteurs iptables encore en place contiennent l'ancien cumul : sans
+  # cette remise à zéro, le premier relevé après mise à jour le réinjecterait
+  # d'un seul coup dans le nouvel historique pourtant vidé.
+  iptables -w 3 -Z "$CIN"  2>/dev/null
+  iptables -w 3 -Z "$COUT" 2>/dev/null
+  iptables -w 3 -Z "$CFWD" 2>/dev/null
+  printf '%s' "$RULES_VER" > "$VERF" 2>/dev/null
+fi
+
+setup_chains(){
+  command -v iptables >/dev/null 2>&1 || return 1
+  local UDP x
+  x=$(cat /etc/nvpanel/xport 2>/dev/null); x=${x:-443}
+
+  # ------------------------------------------------------------------
+  # CAUSE DE LA CONSOMMATION FIGÉE (corrigée ici) :
+  # cette fonction fait un -F (flush) qui remet TOUS les compteurs à zéro.
+  # Or « nvpanel-conso setup » est appelé depuis une douzaine d'endroits,
+  # dont nvpanel-clean lancé par cron TOUTES LES 10 MINUTES, alors que le
+  # relevé (poll) n'a lieu que toutes les 5 minutes.
+  # Résultat : à chaque relevé, la valeur brute lue était sensiblement la
+  # même que celle du relevé précédent (5 min de trafic à chaque fois), donc
+  # la différence calculée valait 0 — la consommation n'augmentait plus
+  # JAMAIS, quel que soit le trafic réel des clients.
+  # Correction : on enregistre ce que les chaînes ont compté AVANT de les
+  # vider, puis on repart d'un dernier relevé à zéro (cohérent avec des
+  # compteurs remis à zéro). Plus aucune perte, et aucun double comptage.
+  # ------------------------------------------------------------------
+  if iptables -w 3 -nL "$CIN" >/dev/null 2>&1; then
+    _accumulate_all
+  fi
+
+  iptables -w 3 -N "$CIN"  2>/dev/null; iptables -w 3 -F "$CIN"  2>/dev/null
+  iptables -w 3 -N "$COUT" 2>/dev/null; iptables -w 3 -F "$COUT" 2>/dev/null
+  iptables -w 3 -N "$CFWD" 2>/dev/null; iptables -w 3 -F "$CFWD" 2>/dev/null
+  while iptables -w 3 -D INPUT   -j "$CIN"  2>/dev/null; do :; done
+  while iptables -w 3 -D OUTPUT  -j "$COUT" 2>/dev/null; do :; done
+  while iptables -w 3 -D FORWARD -j "$CFWD" 2>/dev/null; do :; done
+  iptables -w 3 -I INPUT   -j "$CIN"  2>/dev/null
+  iptables -w 3 -I OUTPUT  -j "$COUT" 2>/dev/null
+  iptables -w 3 -I FORWARD -j "$CFWD" 2>/dev/null
+
+  # ------------------------------------------------------------------
+  # On ne compte QUE des flux qui ne peuvent appartenir qu'à un client VPN.
+  # Les ports 22, 80, 443 et 1723 sont volontairement exclus : ils portent
+  # aussi l'administration du serveur, les certificats, les mises à jour…
+  # ce qui faisait apparaître des dizaines de Go jamais consommés.
+  # ------------------------------------------------------------------
+
+  # 1) Tunnels SSH : UNE RÈGLE PAR COMPTE DU PANEL, jamais une plage d'UID.
+  #    Une plage (1000-59999) englobait l'utilisateur système « ubuntu »
+  #    (uid 1000 sur les images cloud) et tout autre compte non-client :
+  #    leur trafic était compté comme de la consommation client.
+  #    --comment "ssh_bundle" : étiquette utilisée pour isoler la
+  #    consommation du menu SSH/SlowDNS/UDP (menu 01) de celle des autres
+  #    protocoles, sans rien changer au filtrage lui-même.
+  local u uid
+  for u in $(awk '/^### /{print $2}' /etc/nvpanel/db/ssh 2>/dev/null); do
+    uid=$(id -u "$u" 2>/dev/null) || continue
+    [ "$uid" -ge 1000 ] 2>/dev/null || continue
+    iptables -w 3 -A "$COUT" -m owner --uid-owner "$uid" -m comment --comment "ssh_bundle" -j RETURN 2>/dev/null
+  done
+
+  # 2) Xray WebSocket transite par la boucle locale entre nginx et Xray.
+  #    Shadowsocks écoute directement sur son port public et est traité juste
+  #    après avec ses deux transports TCP/UDP.
+  #    Une règle par port (au lieu d'un multiport groupé) : chaque port est
+  #    dédié à UN SEUL protocole (8080 vmess, 8081 vless, 8082 trojan,
+  #    puis 8388 pour Shadowsocks), ce qui permet de les étiqueter séparément pour
+  #    que chaque menu affiche uniquement sa propre consommation. Le
+  #    trafic total compté reste rigoureusement identique.
+  local _xp _xt
+  for _xp in 8080:vmess 8081:vless 8082:trojan; do
+    _xt="${_xp#*:}"; _xp="${_xp%%:*}"
+    iptables -w 3 -A "$COUT" -o lo -p tcp --dport "$_xp" -m comment --comment "$_xt" -j RETURN 2>/dev/null
+    iptables -w 3 -A "$COUT" -o lo -p tcp --sport "$_xp" -m comment --comment "$_xt" -j RETURN 2>/dev/null
+  done
+  # Shadowsocks écoute directement sur 8388 (il ne passe pas par nginx/lo).
+  # TCP et UDP doivent donc être comptés sur les chaînes publiques.
+  iptables -w 3 -A "$CIN"  -p tcp --dport 8388 -m comment --comment "shadowsocks" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$COUT" -p tcp --sport 8388 -m comment --comment "shadowsocks" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$CIN"  -p udp --dport 8388 -m comment --comment "shadowsocks" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$COUT" -p udp --sport 8388 -m comment --comment "shadowsocks" -j RETURN 2>/dev/null
+
+  # Hysteria2 utilise exclusivement UDP/443 ; le trafic TCP/443 de nginx
+  # reste exclu ici pour ne pas compter deux fois les flux Xray WebSocket.
+  iptables -w 3 -A "$CIN"  -p udp --dport 443 -m comment --comment "hysteria" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$COUT" -p udp --sport 443 -m comment --comment "hysteria" -j RETURN 2>/dev/null
+
+  # 3) WireGuard et PPP (L2TP / PPTP / SSTP) : interfaces dédiées aux clients.
+  #    L2TP, PPTP et SSTP utilisent tous l'interface ppp+ : le noyau ne
+  #    permet pas de distinguer les trois à ce niveau, leur consommation
+  #    est donc forcément regroupée sous l'étiquette "ppp" (limite technique,
+  #    comme le temps de connexion déjà non disponible pour ces protocoles).
+  iptables -w 3 -A "$CIN"  -i wg0 -m comment --comment "wg" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$COUT" -o wg0 -m comment --comment "wg" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$CIN"  -i "ppp+" -m comment --comment "ppp" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$COUT" -o "ppp+" -m comment --comment "ppp" -j RETURN 2>/dev/null
+  # Le trafic Internet de ces VPN traverse FORWARD, jamais INPUT/OUTPUT.
+  iptables -w 3 -A "$CFWD" -i wg0 -m comment --comment "wg" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$CFWD" -o wg0 -m comment --comment "wg" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$CFWD" -i "ppp+" -m comment --comment "ppp" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$CFWD" -o "ppp+" -m comment --comment "ppp" -j RETURN 2>/dev/null
+
+  # 4) SlowDNS et UDP : ports exclusivement réservés aux tunnels, regroupés
+  #    avec SSH sous "ssh_bundle" (même menu 01 dans le panel).
+  UDP="5300"
+  local uc; uc=$(grep -oP '"listen"\s*:\s*":?\K[0-9]+' /etc/nvpanel/udp/config.json 2>/dev/null | head -1)
+  [ -n "$uc" ] && UDP="$UDP,$uc"
+  iptables -w 3 -A "$CIN"  -p udp -m multiport --dports "$UDP" -m comment --comment "ssh_bundle" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$COUT" -p udp -m multiport --sports "$UDP" -m comment --comment "ssh_bundle" -j RETURN 2>/dev/null
+  # BadVPN UDPGW écoute en TCP sur localhost (7100/7200/7300), pas en UDP.
+  iptables -w 3 -A "$COUT" -o lo -p tcp -m multiport --dports 7100,7200,7300 -m comment --comment "ssh_bundle" -j RETURN 2>/dev/null
+  iptables -w 3 -A "$COUT" -o lo -p tcp -m multiport --sports 7100,7200,7300 -m comment --comment "ssh_bundle" -j RETURN 2>/dev/null
+  # Les compteurs viennent d'être vidés : le dernier relevé doit valoir 0,
+  # sinon le prochain poll calculerait une différence négative puis repartirait
+  # de travers.
+  printf '0' > "$LASTF" 2>/dev/null
+  local _tag
+  for _tag in $CONSO_TAGS; do
+    printf '0' > "$DBDIR/.conso.last.$_tag" 2>/dev/null
+  done
+  iptables -w 3 -C INPUT -j "$CIN" 2>/dev/null \
+    && iptables -w 3 -C OUTPUT -j "$COUT" 2>/dev/null \
+    && iptables -w 3 -C FORWARD -j "$CFWD" 2>/dev/null \
+    && iptables -w 3 -S "$COUT" 2>/dev/null | grep -q -- '--comment vmess' \
+    && iptables -w 3 -S "$CIN" 2>/dev/null | grep -q -- '--comment shadowsocks' \
+    && iptables -w 3 -S "$CFWD" 2>/dev/null | grep -q -- '--comment wg' \
+    || return 1
+  return 0
+}
+
+# Ajoute les règles par UID manquantes pour les comptes SSH créés APRÈS la
+# toute première mise en place des chaînes — SANS jamais les flusher (donc
+# sans jamais remettre les compteurs déjà en cours d'accumulation à zéro).
+# `-C` vérifie si la règle existe déjà avant de l'ajouter (idempotent).
+ensure_accounts(){
+  command -v iptables >/dev/null 2>&1 || return 0
+  local u uid spec existing
+  spec="${RULES_OUT:-}"
+  [ -n "$spec" ] || spec=$(iptables -w 3 -S "$COUT" 2>/dev/null)
+  existing=$(printf '%s\n' "$spec" | awk '/--comment ssh_bundle/ && /--uid-owner/ {for(i=1;i<=NF;i++) if($i=="--uid-owner") print $(i+1)}')
+  for u in $(awk '/^### /{print $2}' /etc/nvpanel/db/ssh 2>/dev/null); do
+    uid=$(id -u "$u" 2>/dev/null) || continue
+    [ "$uid" -ge 1000 ] 2>/dev/null || continue
+    printf '%s\n' "$existing" | grep -qxF "$uid" 2>/dev/null && continue
+    if iptables -w 3 -A "$COUT" -m owner --uid-owner "$uid" -m comment --comment "ssh_bundle" -j RETURN 2>/dev/null; then
+      existing="${existing}${existing:+$'\n'}$uid"
+    fi
+  done
+}
+
+# Un relevé iptables complet par chaîne suffit pour le total ET les huit
+# protocoles. L'ancienne version relançait iptables 27 fois par poll
+# (3 chaînes x total + 3 chaînes x 8 tags), ce qui expliquait 5 à 7 secondes.
+# Les snapshots sont pris sous le même verrou que l'accumulation.
+_snapshot_chains(){
+  SNAP_IN=$(iptables -w 3 -nvxL "$CIN" 2>/dev/null) || return 1
+  SNAP_OUT=$(iptables -w 3 -nvxL "$COUT" 2>/dev/null) || return 1
+  SNAP_FWD=$(iptables -w 3 -nvxL "$CFWD" 2>/dev/null) || return 1
+  return 0
+}
+
+_snapshot_bytes(){
+  awk 'NR>2 {s+=$2} END{printf "%.0f", s+0}' <<< "$1"
+}
+
+_snapshot_tag_bytes(){
+  awk -v t="/* $2 */" 'NR>2 && index($0,t){s+=$2} END{printf "%.0f", s+0}' <<< "$1"
+}
+
+# Au moins un compte client existe-t-il, tous protocoles confondus ?
+_has_account(){
+  local f
+  for f in ssh vmess vless trojan shadowsocks wireguard l2tp pptp sstp hysteria; do
+    grep -q '^### ' "$DBDIR/$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+_has_tag_account(){
+  case "$1" in
+    ssh_bundle) grep -q '^### ' "$DBDIR/ssh" 2>/dev/null ;;
+    vmess|vless|trojan) grep -q '^### ' "$DBDIR/$1" 2>/dev/null ;;
+    shadowsocks) grep -q '^### ' "$DBDIR/shadowsocks" 2>/dev/null ;;
+    hysteria) grep -q '^### ' "$DBDIR/hysteria" 2>/dev/null ;;
+    wg) grep -q '^### ' "$DBDIR/wireguard" 2>/dev/null ;;
+    ppp)
+      grep -q '^### ' "$DBDIR/l2tp" 2>/dev/null || \
+      grep -q '^### ' "$DBDIR/pptp" 2>/dev/null || \
+      grep -q '^### ' "$DBDIR/sstp" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# Lit les compteurs des chaînes et ajoute à l'historique la DIFFÉRENCE avec le
+# dernier relevé. Extrait de poll() pour pouvoir être appelé AUSSI avant un
+# flush : sans cela tout le trafic accumulé depuis le dernier relevé était
+# définitivement perdu (voir setup_chains).
+# N'assure PAS le verrou : l'appelant doit déjà le détenir.
+_accumulate(){
+  local raw last delta today cur i o f
+  i=$(_snapshot_bytes "$SNAP_IN"); o=$(_snapshot_bytes "$SNAP_OUT"); f=$(_snapshot_bytes "$SNAP_FWD")
+  raw=$(( i + o + f ))
+
+  # On NE remet PLUS les compteurs à zéro. On mémorise leur dernière valeur
+  # brute et on n'ajoute que la DIFFÉRENCE.
+  # Avant, on lisait puis on remettait à zéro : si cette remise à zéro
+  # échouait (deux commandes iptables simultanées se bloquent l'une l'autre),
+  # la même valeur était recomptée à chaque affichage du menu — d'où des
+  # dizaines de Go apparus sans aucun trafic réel.
+  last=$(cat "$LASTF" 2>/dev/null); last=${last:-0}
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$raw" -ge "$last" ] 2>/dev/null; then
+    delta=$(( raw - last ))
+  else
+    # les compteurs ont été remis à zéro par ailleurs (redémarrage, règles
+    # recréées) : on repart de la valeur courante
+    delta="$raw"
+  fi
+  printf '%s' "$raw" > "$LASTF" 2>/dev/null
+
+  # Tant qu'aucun compte n'existe, aucun octet ne peut appartenir à un client.
+  # Ce qui touche malgré tout les ports comptés est du bruit d'internet — sur
+  # le port SlowDNS surtout, très sollicité par les scans et les résolveurs
+  # dès que l'enregistrement NS est publié. C'est ce qui faisait grimper la
+  # consommation de quelques Ko à chaque rafraîchissement du menu sur un
+  # serveur pourtant vierge de tout compte.
+  # Le dernier relevé vient d'être mis à jour juste au-dessus : ce bruit ne
+  # sera donc pas non plus imputé plus tard, à la création du premier compte.
+  _has_account || return 0
+
+  [ "$delta" -le 0 ] 2>/dev/null && return 0
+  today=$(date +%F)
+  cur=$(awk -F'|' -v d="$today" '$1==d{print $2}' "$DB" 2>/dev/null | tail -1)
+  cur=${cur:-0}
+  sed -i "/^$today|/d" "$DB" 2>/dev/null
+  printf '%s|%s\n' "$today" "$(( cur + delta ))" >> "$DB"
+  tail -n 120 "$DB" > "$DB.tmp" 2>/dev/null && mv "$DB.tmp" "$DB"
+  return 0
+}
+
+# Même principe que _accumulate (delta depuis le dernier relevé, jamais de
+# remise à zéro directe), mais pour UNE étiquette de protocole, dans son
+# propre fichier d'historique. N'a AUCUN effet sur $DB / $LASTF (le total
+# global du menu d'accueil) : c'est un suivi entièrement séparé, ajouté
+# à côté de l'existant plutôt qu'à sa place.
+_accumulate_tag(){
+  local tag="$1" lastf dbf raw last delta today cur ti to tf
+  lastf="$DBDIR/.conso.last.$tag"
+  dbf="$DBDIR/conso_$tag"
+  ti=$(_snapshot_tag_bytes "$SNAP_IN" "$tag"); to=$(_snapshot_tag_bytes "$SNAP_OUT" "$tag"); tf=$(_snapshot_tag_bytes "$SNAP_FWD" "$tag")
+  raw=$(( ti + to + tf ))
+  last=$(cat "$lastf" 2>/dev/null); last=${last:-0}
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$raw" -ge "$last" ] 2>/dev/null; then
+    delta=$(( raw - last ))
+  else
+    delta="$raw"
+  fi
+  printf '%s' "$raw" > "$lastf" 2>/dev/null
+  _has_tag_account "$tag" || return 0
+  [ "$delta" -le 0 ] 2>/dev/null && return 0
+  today=$(date +%F)
+  cur=$(awk -F'|' -v d="$today" '$1==d{print $2}' "$dbf" 2>/dev/null | tail -1)
+  cur=${cur:-0}
+  sed -i "/^$today|/d" "$dbf" 2>/dev/null
+  printf '%s|%s\n' "$today" "$(( cur + delta ))" >> "$dbf"
+  tail -n 120 "$dbf" > "$dbf.tmp" 2>/dev/null && mv "$dbf.tmp" "$dbf"
+  return 0
+}
+
+# Point d'entrée unique appelé partout où _accumulate l'était : fait
+# EXACTEMENT ce que faisait _accumulate (total global, inchangé), puis
+# met aussi à jour le détail par protocole. Un appel oublié quelque part
+# casserait uniquement le détail par protocole, jamais le total global.
+_accumulate_all(){
+  # Si une lecture iptables échoue, on ne touche surtout pas aux références
+  # `conso.last` : cela évite qu'un snapshot vide soit pris pour un reset.
+  _snapshot_chains || return 0
+  _accumulate
+  local tag
+  for tag in $CONSO_TAGS; do _accumulate_tag "$tag"; done
+}
+
+_chains_ready(){
+  RULES_IN=$(iptables -w 3 -S "$CIN" 2>/dev/null) || return 1
+  RULES_OUT=$(iptables -w 3 -S "$COUT" 2>/dev/null) || return 1
+  RULES_FWD=$(iptables -w 3 -S "$CFWD" 2>/dev/null) || return 1
+  printf '%s\n' "$RULES_OUT" | grep -q -- '--comment vmess' || return 1
+  printf '%s\n' "$RULES_OUT" | grep -q -- '--comment vless' || return 1
+  printf '%s\n' "$RULES_OUT" | grep -q -- '--comment trojan' || return 1
+  printf '%s\n' "$RULES_IN"  | grep -q -- '--dport 8388.*--comment shadowsocks' || return 1
+  printf '%s\n' "$RULES_IN"  | grep -q -- '--dport 443.*--comment hysteria' || return 1
+  printf '%s\n' "$RULES_FWD" | grep -q -- '-i wg0.*--comment wg' || return 1
+  printf '%s\n' "$RULES_FWD" | grep -q -- '-i ppp+.*--comment ppp' || return 1
+  printf '%s\n' "$RULES_OUT" | grep -q -- '--dports 7100,7200,7300.*--comment ssh_bundle' || return 1
+  return 0
+}
+
+_ensure_jump_first(){
+  local base="$1" counter="$2" spec first
+  spec=$(iptables -w 3 -S "$base" 2>/dev/null) || return 0
+  first=$(printf '%s\n' "$spec" | awk '$1=="-A"{print; exit}')
+  [ "$first" = "-A $base -j $counter" ] && return 0
+  while iptables -w 3 -D "$base" -j "$counter" 2>/dev/null; do :; done
+  iptables -w 3 -I "$base" -j "$counter" 2>/dev/null
+}
+
+poll(){
+  command -v iptables >/dev/null 2>&1 || return 0
+  local _wait="${1:-5}"
+  (
+  flock -w "$_wait" 201 || return 0
+  # Trois `iptables -S` seulement au lieu de relire les mêmes chaînes pour
+  # chaque test. Une reconstruction complète reste réservée aux règles absentes.
+  if ! _chains_ready; then
+    setup_chains
+  fi
+  ensure_accounts
+
+  # Les renvois doivent rester les premières règles, mais on ne fait plus le
+  # coûteux delete+insert à chaque poll si leur position est déjà correcte.
+  _ensure_jump_first INPUT "$CIN"
+  _ensure_jump_first OUTPUT "$COUT"
+  _ensure_jump_first FORWARD "$CFWD"
+
+  _accumulate_all
+  ) 201>"$DBDIR/.conso.lock"
+  return 0
+}
+
+
+read_vals(){ # affiche "hier|aujourdhui|mois" en octets
+  poll 1 >/dev/null 2>&1
+  local t y m today yest month
+  today=$(date +%F); yest=$(date -d 'yesterday' +%F 2>/dev/null); month=$(date +%Y-%m)
+  # "%.0f" et non "%d" : même correction que dans _chain_bytes ci-dessus,
+  # pour ne pas réintroduire le débordement 32 bits lors de la somme
+  # mensuelle (qui additionne plusieurs jours et dépasse vite 4 Go).
+  t=$(awk -F'|' -v d="$today" '$1==d{s+=$2} END{printf "%.0f", s+0}' "$DB" 2>/dev/null)
+  y=$(awk -F'|' -v d="$yest"  '$1==d{s+=$2} END{printf "%.0f", s+0}' "$DB" 2>/dev/null)
+  m=$(awk -F'|' -v p="$month" 'index($1,p)==1{s+=$2} END{printf "%.0f", s+0}' "$DB" 2>/dev/null)
+  echo "${y:-0}|${t:-0}|${m:-0}"
+}
+
+# Identique à read_vals, mais pour une étiquette de protocole précise
+# (fichier /etc/nvpanel/db/conso_<tag>). Utilisée par chaque menu de
+# protocole pour n'afficher que sa propre consommation.
+read_vals_tag(){
+  local tag="$1" dbf t y m today yest month
+  dbf="$DBDIR/conso_$tag"
+  poll 1 >/dev/null 2>&1
+  today=$(date +%F); yest=$(date -d 'yesterday' +%F 2>/dev/null); month=$(date +%Y-%m)
+  t=$(awk -F'|' -v d="$today" '$1==d{s+=$2} END{printf "%.0f", s+0}' "$dbf" 2>/dev/null)
+  y=$(awk -F'|' -v d="$yest"  '$1==d{s+=$2} END{printf "%.0f", s+0}' "$dbf" 2>/dev/null)
+  m=$(awk -F'|' -v p="$month" 'index($1,p)==1{s+=$2} END{printf "%.0f", s+0}' "$dbf" 2>/dev/null)
+  echo "${y:-0}|${t:-0}|${m:-0}"
+}
+
+reset_all(){
+  printf '%s' "$RULES_VER" > "$VERF" 2>/dev/null
+  # 1) on vide l'historique
+  : > "$DB" 2>/dev/null
+  rm -f "$DB.tmp" "$LASTF" 2>/dev/null
+  # 1bis) idem pour le détail par protocole, sinon il resterait décalé
+  # par rapport au total global qui vient d'être remis à zéro.
+  local tag
+  for tag in $CONSO_TAGS; do
+    rm -f "$DBDIR/conso_$tag" "$DBDIR/conso_$tag.tmp" "$DBDIR/.conso.last.$tag" 2>/dev/null
+  done
+  # 2) on remet les compteurs iptables à zéro
+  iptables -w 3 -Z "$CIN"  2>/dev/null
+  iptables -w 3 -Z "$COUT" 2>/dev/null
+  iptables -w 3 -Z "$CFWD" 2>/dev/null
+  # 3) on recrée les chaînes : garantit qu'aucun compteur résiduel ne subsiste
+  setup_chains >/dev/null 2>&1
+  iptables -w 3 -Z "$CIN"  2>/dev/null
+  iptables -w 3 -Z "$COUT" 2>/dev/null
+  iptables -w 3 -Z "$CFWD" 2>/dev/null
+  : > "$DB" 2>/dev/null
+  return 0
+}
+
+remove_all(){
+  while iptables -w 3 -D INPUT   -j "$CIN"  2>/dev/null; do :; done
+  while iptables -w 3 -D OUTPUT  -j "$COUT" 2>/dev/null; do :; done
+  while iptables -w 3 -D FORWARD -j "$CFWD" 2>/dev/null; do :; done
+  iptables -w 3 -F "$CIN"  2>/dev/null; iptables -w 3 -X "$CIN"  2>/dev/null
+  iptables -w 3 -F "$COUT" 2>/dev/null; iptables -w 3 -X "$COUT" 2>/dev/null
+  iptables -w 3 -F "$CFWD" 2>/dev/null; iptables -w 3 -X "$CFWD" 2>/dev/null
+  return 0
+}
+
+# Affiche le détail de chaque règle : permet de voir d'un coup d'œil
+# quel flux fait monter le compteur.
+debug_rules(){
+  command -v iptables >/dev/null 2>&1 || { echo "iptables absent"; return 1; }
+  local c
+  for c in "$CIN" "$COUT" "$CFWD"; do
+    printf '\n=== %s ===\n' "$c"
+    iptables -w 3 -nvxL "$c" 2>/dev/null | awk 'NR>2 {
+      b=$2; u="o";
+      if (b>=1073741824) { b=b/1073741824; u="Go" }
+      else if (b>=1048576) { b=b/1048576; u="Mo" }
+      else if (b>=1024) { b=b/1024; u="Ko" }
+      desc=""; for (i=9;i<=NF;i++) desc=desc" "$i
+      printf "  %10.1f %-2s |%s\n", b, u, desc
+    }'
+  done
+  printf '\nDernier relevé brut : %s octets\n' "$(cat "$LASTF" 2>/dev/null || echo 0)"
+  printf 'Historique :\n'; tail -5 "$DB" 2>/dev/null
+}
+
+case "$1" in
+  debug)  debug_rules ;;
+  # setup et reset touchent aux compteurs : ils prennent le MÊME verrou que
+  # poll, sinon un relevé lancé en parallèle (cron, affichage d'un menu)
+  # pouvait lire des compteurs en cours de reconstruction et compter deux fois.
+  setup)  ( flock -w 10 202 || exit 0; setup_chains ) 202>"$DBDIR/.conso.lock" ;;
+  poll)   poll ;;
+  read)   if [ -n "$2" ]; then read_vals_tag "$2"; else read_vals; fi ;;
+  reset)  ( flock -w 10 202 || exit 0; reset_all ) 202>"$DBDIR/.conso.lock" ;;
+  remove) remove_all ;;
+  *)      echo "usage: nvpanel-conso setup|poll|read|reset|remove|debug" ;;
+esac
+exit 0

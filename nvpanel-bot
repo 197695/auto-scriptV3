@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+# ============================================================
+#  nvpanel · bot Telegram (SSH + Xray/Vmess/Vless/Trojan/SS)
+#  stdlib uniquement · reserve a l'ADMIN · boutons horizontaux
+#  Config : /etc/nvpanel/bot.conf  ->  TOKEN=...  ADMIN=...
+# ============================================================
+import json, subprocess, urllib.request, urllib.parse, time, shlex
+
+CONF = "/etc/nvpanel/bot.conf"
+
+def load_conf():
+    c = {}
+    with open(CONF) as f:
+        for ln in f:
+            ln = ln.strip()
+            if "=" in ln and not ln.startswith("#"):
+                k, v = ln.split("=", 1); c[k.strip()] = v.strip()
+    return c
+
+conf = load_conf()
+TOKEN = conf.get("TOKEN", ""); ADMIN = str(conf.get("ADMIN", ""))
+API = "https://api.telegram.org/bot%s/" % TOKEN
+STATE = {}
+# Position de lecture des mises à jour Telegram. Doit être GLOBALE : elle était
+# locale à main(), donc remise à zéro à chaque relance de la boucle (exception
+# réseau, redémarrage du service). Telegram conserve 24 h les mises à jour non
+# confirmées et les renvoyait alors toutes — le menu s'affichait plusieurs fois
+# de suite.
+OFFSET = None
+
+def api(method, **params):
+    data = urllib.parse.urlencode(
+        {k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in params.items()}
+    ).encode()
+    try:
+        with urllib.request.urlopen(API + method, data=data, timeout=60) as r:
+            return json.load(r)
+    except Exception:
+        return {}
+
+def esc(t):
+    """Échappe les caractères réservés par le HTML de Telegram."""
+    return (str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+def cli(*args):
+    try:
+        return subprocess.run(["nvpanel-cli", *args], capture_output=True, text=True, timeout=40).stdout.strip()
+    except Exception as e:
+        return "ERR %s" % e
+
+def read_file(p):
+    try:
+        with open(p) as f: return f.read().strip()
+    except Exception:
+        return ""
+
+def count_db(name):
+    try:
+        with open("/etc/nvpanel/db/" + name) as f:
+            return sum(1 for l in f if l.startswith("### "))
+    except Exception:
+        return 0
+
+def sys_info():
+    up = ram = load = "?"
+    try:
+        s = float(read_file("/proc/uptime").split()[0])
+        d = int(s // 86400); h = int((s % 86400) // 3600); m = int((s % 3600) // 60)
+        up = ("%dj %dh %dm" % (d, h, m)) if d else ("%dh %dm" % (h, m))
+    except Exception:
+        pass
+    try:
+        mem = {}
+        for ln in open("/proc/meminfo"):
+            k, v = ln.split(":"); mem[k] = int(v.strip().split()[0])
+        tot = mem["MemTotal"] // 1024; avail = mem.get("MemAvailable", 0) // 1024
+        ram = "%d/%d Mo" % (tot - avail, tot)
+    except Exception:
+        pass
+    try:
+        load = " ".join(read_file("/proc/loadavg").split()[:3])
+    except Exception:
+        pass
+    return up, ram, load
+
+def os_name():
+    """Nom du système, identique à ce que le panel affiche (PRETTY_NAME de
+    /etc/os-release)."""
+    return sh('. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}"') or "Linux"
+
+def cores():
+    """Nombre de cœurs CPU, identique au panel (nproc)."""
+    return sh("nproc 2>/dev/null") or "?"
+
+def hr(b):
+    """Format lisible (o/Ko/Mo/Go...), identique à _hr() du panel."""
+    try:
+        b = float(b)
+    except Exception:
+        b = 0.0
+    for u in ("o", "Ko", "Mo", "Go", "To", "Po"):
+        if b < 1024:
+            return "%.1f %s" % (b, u)
+        b /= 1024
+    return "%.1f Po" % b
+
+def fmt_date(d):
+    """Convertit une date AAAA-MM-JJ (format renvoyé par les scripts) en
+    JJ-MM-AAAA pour l'affichage — identique à _fmtd() du panel. Le bot ne
+    stocke ni ne compare jamais de dates, uniquement de l'affichage : rien
+    d'autre n'est concerné par cette conversion."""
+    if not d:
+        return d
+    try:
+        y, m, day = d.strip().split("-")
+        if len(y) == 4:
+            return "%s-%s-%s" % (day, m, y)
+    except Exception:
+        pass
+    return d
+
+def conso_raw():
+    """hier|auj|mois en octets — délègue à nvpanel-conso, exactement la
+    même source de données que le panel (_conso_raw dans ui.sh)."""
+    try:
+        out = subprocess.run(["nvpanel-conso", "read"], capture_output=True,
+                              text=True, timeout=15).stdout.strip()
+        parts = out.split("|")
+        if len(parts) == 3:
+            return parts
+    except Exception:
+        pass
+    return ("0", "0", "0")
+
+def sh(cmd):
+    try:
+        return subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=15).stdout.strip()
+    except Exception:
+        return ""
+
+def _int(s):
+    try:
+        return int(str(s).strip())
+    except Exception:
+        return 0
+
+def ssh_online():
+    # Identique à _ssh_online() du panel : on part des PROCESSUS (méthode
+    # d'origine fiable), jamais de la position des colonnes de "ss" (leur
+    # nombre varie selon la version d'iproute2 installée — une première
+    # version basée sur $4/$5 avait cassé la détection : 0 en ligne alors
+    # qu'un compte était bien connecté). L'IP est extraite par expression
+    # régulière dans la sortie de "ss" ; si introuvable, le compte est
+    # quand même compté une fois — jamais moins fiable que l'ancienne
+    # méthode, plus précis (par IP distincte) quand c'est possible.
+    return _int(sh(
+        "ss_raw=$(ss -tnp state established 2>/dev/null)\n"
+        "ps -eo pid=,user=,comm= 2>/dev/null | awk '$3 ~ /sshd|dropbear/{print $1\"|\"$2}' | "
+        "while IFS='|' read -r pid u; do\n"
+        "  [ -z \"$pid\" ] || [ -z \"$u\" ] && continue\n"
+        "  grep -q \"^### $u \" /etc/nvpanel/db/ssh 2>/dev/null || continue\n"
+        "  ip=$(printf '%s\\n' \"$ss_raw\" | grep \"pid=$pid,\" | "
+        "grep -oP '[0-9]{1,3}(\\.[0-9]{1,3}){3}:[0-9]+|\\[[0-9a-fA-F:]+\\]:[0-9]+' | "
+        "tail -1 | sed -E 's/:[0-9]+$//')\n"
+        "  printf '%s|%s\\n' \"$u\" \"${ip:-pid$pid}\"\n"
+        "done | sort -u | wc -l"
+    ))
+
+def ssh_blocked():
+    return _int(sh("c=0; while read _ u _; do [ -z \"$u\" ] && continue; "
+                   "s=$(passwd -S \"$u\" 2>/dev/null | awk '{print $2}'); "
+                   "[ \"$s\" = L ] && c=$((c+1)); done < /etc/nvpanel/db/ssh 2>/dev/null; echo $c"))
+
+def port_online(p):
+    # Clients UNIQUES (par IP source), jamais un simple nombre de connexions
+    # établies : une application peut ouvrir plusieurs flux TCP en parallèle
+    # (multiplexage), ce qui gonflait ce chiffre bien au-delà du nombre réel
+    # de personnes connectées (ex. observé : 3 comptes Vless affichés comme
+    # 145 « en ligne »). Identique à _online_uniq_port() dans le panel.
+    return _int(sh("ss -tnH state established '( sport = :%s )' 2>/dev/null "
+                   "| awk '{print $4}' | sed -E 's/:[0-9]+$//' | sort -u | wc -l" % p))
+
+def xray_online(proto):
+    # Même source de vérité que le panel : activité réelle échantillonnée
+    # par compte via l'API de statistiques Xray. Cela évite de compter les
+    # sockets nginx, impossibles à attribuer proprement à un protocole.
+    return _int(cli("xonline", proto))
+
+def blocked_count(name, field=5):
+    # Comptes verrouillés (colonne 5 = L) pour un protocole donné. Le bot ne
+    # comptait jusqu'ici que les comptes SSH verrouillés : le total
+    # « Bloqués » ne correspondait donc pas à celui du panel dès qu'un
+    # compte d'un autre protocole était verrouillé.
+    return _int(sh("awk -v col=%d '/^### /{if($col==\"L\")c++} END{print c+0}' /etc/nvpanel/db/%s 2>/dev/null" % (field, name)))
+
+def wg_online():
+    return _int(sh("wg show wg0 latest-handshakes 2>/dev/null | "
+                   "awk -v n=$(date +%s) '$2>0 && (n-$2)<75{c++} END{print c+0}'"))
+
+def main_kb():
+    return {"inline_keyboard": [
+        [{"text": "\U0001F4CA Surveillance", "callback_data": "monitor"}, {"text": "\U0001F5A5 Serveur", "callback_data": "status"}],
+        [{"text": "\u2795 Cr\u00e9er SSH", "callback_data": "create"}, {"text": "\U0001F4CB Comptes SSH", "callback_data": "list"}],
+        [{"text": "\u267B\uFE0F Prolonger", "callback_data": "renew"}, {"text": "\U0001F5D1 Suppr SSH", "callback_data": "delete"}],
+        [{"text": "\U0001F512 Verrouiller", "callback_data": "lock"}, {"text": "\U0001F513 D\u00e9verrouiller", "callback_data": "unlock"}],
+        [{"text": "\U0001F7E3 Vmess", "callback_data": "p:vmess"}, {"text": "\U0001F535 Vless", "callback_data": "p:vless"}],
+        [{"text": "\U0001F7E0 Trojan", "callback_data": "p:trojan"}, {"text": "\U0001F7E2 Shadowsocks", "callback_data": "p:ss"}],
+        [{"text": "\U0001F7E4 L2TP", "callback_data": "pp:l2tp"}, {"text": "\U0001F4E1 PPTP", "callback_data": "pp:pptp"}],
+        [{"text": "\U0001F510 SSTP", "callback_data": "pp:sstp"}, {"text": "\U0001F6E1 WireGuard", "callback_data": "wg:list"}],
+        [{"text": "\u26A1 Hysteria2", "callback_data": "hy:menu"}],
+        [{"text": "\U0001F381 Compte test 24h", "callback_data": "trial"}],
+        [{"text": "\U0001F9F9 Purger les expir\u00e9s", "callback_data": "purge"}],
+        [{"text": "\U0001F504 Rafra\u00eechir le menu", "callback_data": "menu"}],
+    ]}
+
+def proto_kb(p):
+    return {"inline_keyboard": [
+        [{"text": "\u2795 Ajouter", "callback_data": "pa:%s" % p}, {"text": "\U0001F4CB Liste", "callback_data": "pl:%s" % p}],
+        [{"text": "\U0001F5D1 Supprimer", "callback_data": "pd:%s" % p}, {"text": "\u2B05\uFE0F Retour", "callback_data": "menu"}],
+    ]}
+
+
+def proto_choice_kb(prefix):
+    """Clavier de choix du protocole. prefix identifie l'action demandee."""
+    return {"inline_keyboard": [
+        [{"text": "\U0001F510 SSH", "callback_data": "%s:ssh" % prefix},
+         {"text": "\U0001F7E3 Vmess", "callback_data": "%s:vmess" % prefix}],
+        [{"text": "\U0001F535 Vless", "callback_data": "%s:vless" % prefix},
+         {"text": "\U0001F7E0 Trojan", "callback_data": "%s:trojan" % prefix}],
+        [{"text": "\U0001F7E2 Shadowsocks", "callback_data": "%s:ss" % prefix},
+         {"text": "\U0001F7E4 L2TP", "callback_data": "%s:l2tp" % prefix}],
+        [{"text": "\U0001F4E1 PPTP", "callback_data": "%s:pptp" % prefix},
+         {"text": "\U0001F511 SSTP", "callback_data": "%s:sstp" % prefix}],
+        [{"text": "\u274C Annuler", "callback_data": "cancel"}],
+    ]}
+
+PROTO_NAME = {"ssh": "SSH", "vmess": "Vmess", "vless": "Vless", "trojan": "Trojan",
+              "ss": "Shadowsocks", "l2tp": "L2TP", "pptp": "PPTP", "sstp": "SSTP"}
+
+def trial_kb():
+    return {"inline_keyboard": [
+        [{"text": "SSH", "callback_data": "t:ssh"}, {"text": "Vmess", "callback_data": "t:vmess"}],
+        [{"text": "Vless", "callback_data": "t:vless"}, {"text": "Trojan", "callback_data": "t:trojan"}],
+        [{"text": "Shadowsocks", "callback_data": "t:ss"}, {"text": "L2TP", "callback_data": "t:l2tp"}],
+        [{"text": "PPTP", "callback_data": "t:pptp"}, {"text": "SSTP", "callback_data": "t:sstp"}],
+        [{"text": "\u274C Annuler", "callback_data": "cancel"}],
+    ]}
+
+def purge_kb():
+    return {"inline_keyboard": [
+        [{"text": "SSH", "callback_data": "g:ssh"}, {"text": "Vmess", "callback_data": "g:vmess"}],
+        [{"text": "Vless", "callback_data": "g:vless"}, {"text": "Trojan", "callback_data": "g:trojan"}],
+        [{"text": "Shadowsocks", "callback_data": "g:ss"}, {"text": "L2TP", "callback_data": "g:l2tp"}],
+        [{"text": "PPTP", "callback_data": "g:pptp"}, {"text": "SSTP", "callback_data": "g:sstp"}],
+        [{"text": "\u274C Annuler", "callback_data": "cancel"}],
+    ]}
+
+def ppp_kb(p):
+    return {"inline_keyboard": [
+        [{"text": "\u2795 Ajouter", "callback_data": "pa2:%s" % p}, {"text": "\U0001F4CB Liste", "callback_data": "pl2:%s" % p}],
+        [{"text": "\U0001F5D1 Supprimer", "callback_data": "pd2:%s" % p}, {"text": "\u2B05\uFE0F Retour", "callback_data": "menu"}],
+    ]}
+
+def hy_kb():
+    return {"inline_keyboard": [
+        [{"text": "\u2795 Ajouter", "callback_data": "hya"}, {"text": "\U0001F4CB Liste", "callback_data": "hyl"}],
+        [{"text": "\U0001F5D1 Supprimer", "callback_data": "hyd"}, {"text": "\u2B05\uFE0F Retour", "callback_data": "menu"}],
+    ]}
+
+def split_dns_key(box):
+    """Sépare la clé DNS du reste de la fiche.
+
+    Dans un bloc <pre>, Telegram renvoie la ligne à ~33 caractères sur
+    téléphone : une clé de 64 caractères y est donc coupée en deux, et la
+    copie donne une clé invalide. On la retire du bloc pour la présenter
+    seule en <code>, que Telegram copie intégralement d'un seul appui.
+    """
+    kept, key = [], ""
+    for line in box.splitlines():
+        st = line.strip()
+        if len(st) == 64 and all(c in "0123456789abcdefABCDEF" for c in st):
+            key = st
+            if kept and kept[-1].rstrip().endswith(":"):
+                kept.pop()          # on retire aussi son libellé devenu orphelin
+            continue
+        kept.append(line)
+    return "\n".join(kept), key
+
+def dns_key_line(key=""):
+    """Clé DNS dans un bloc <code> : Telegram la copie entièrement d'un appui,
+    sans le retour à la ligne que provoque l'affichage du terminal."""
+    k = key or read_file("/etc/nvpanel/slowdns/server.pub")
+    if not k:
+        return ""
+    return "\n\n\U0001F510 <b>Cl\u00e9 DNS</b> (appuie pour copier) :\n<code>%s</code>" % esc(k)
+
+def rand_name():
+    import random, string
+    return "test" + "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(4))
+
+def rand_pass():
+    import random, string
+    return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(8))
+
+def ppp(*args):
+    try:
+        return subprocess.run(["nvpanel-ppp", *args], capture_output=True, text=True, timeout=40).stdout.strip()
+    except Exception as e:
+        return "ERR %s" % e
+
+def hy(*args):
+    try:
+        return subprocess.run(["nvpanel-hysteria", *args], capture_output=True, text=True, timeout=40).stdout.strip()
+    except Exception as e:
+        return "ERR %s" % e
+
+def cancel_kb():
+    return {"inline_keyboard": [[{"text": "\u274C Annuler / Retour", "callback_data": "cancel"}]]}
+
+def conn_time(u):
+    """Durée de connexion d'un compte SSH — identique à _conn_time() du
+    panel (durée du plus vieux processus appartenant à l'utilisateur).
+    Retourne "" si pas connecté (aucune donnée fiable de ce type n'existe
+    pour les autres protocoles : voir wg_time pour WireGuard, le seul
+    autre protocole où c'est possible)."""
+    out = sh("ps -o etimes= -u %s 2>/dev/null | tr -d ' ' | sort -rn | head -1" % shlex.quote(u))
+    try:
+        et = int(out)
+    except Exception:
+        return ""
+    if et < 5:
+        return ""
+    if et >= 86400:
+        return "%dj %dh" % (et // 86400, (et % 86400) // 3600)
+    if et >= 3600:
+        return "%dh %02dmin" % (et // 3600, (et % 3600) // 60)
+    return "%dmin" % (et // 60)
+
+def wg_time(pub):
+    """Ancienneté de la dernière poignée de main WireGuard pour cette clé
+    publique — identique à _wg_time() du panel. Retourne "" si le client
+    n'a jamais négocié ou si sa dernière poignée de main date de plus de
+    75 secondes (3 intervalles de keepalive, considéré comme déconnecté)."""
+    hs = sh("wg show wg0 latest-handshakes 2>/dev/null | awk -v p=%s '$1==p{print $2}'" % shlex.quote(pub))
+    try:
+        hs = int(hs)
+    except Exception:
+        return ""
+    if hs == 0:
+        return ""
+    d = int(time.time()) - hs
+    if d > 75 or d < 0:
+        return ""
+    if d >= 3600:
+        return "%dh %02dmin" % (d // 3600, (d % 3600) // 60)
+    return "%dmin" % (d // 60)
+
+def send(chat, text, kb=None):
+    mk = kb if kb is not None else main_kb()
+    api("sendMessage", chat_id=chat, text=text, parse_mode="HTML", reply_markup=mk)
+
+MENU_TXT = ("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "   \U0001F6F0 <b>RHAFF SERVICE</b>\n"
+            "   <i>Panel gestion &amp; contr\u00f4le</i>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+            "Choisissez une commande \U0001F447")
+
+def show_menu(chat):
+    send(chat, MENU_TXT)
+
+def do_monitor(chat):
+    up, ram, load = sys_info()
+    ip = read_file("/etc/nvpanel/ip") or "?"
+    dom = read_file("/etc/nvpanel/domain") or "non configur\u00e9"
+    ssh = count_db("ssh"); vm = count_db("vmess"); vl = count_db("vless")
+    tr = count_db("trojan"); ss = count_db("shadowsocks"); wg = count_db("wireguard")
+    l2 = count_db("l2tp"); pp = count_db("pptp"); st = count_db("sstp")
+    hy_ct = count_db("hysteria")
+    total = ssh + vm + vl + tr + ss + wg + l2 + pp + st + hy_ct
+
+    on_ssh = ssh_online()
+    # Une seule interrogation Xray pour les quatre protocoles : même donnée
+    # réelle que le panel, sans quatre chargements successifs.
+    xd = cli("xonline", "all-detail") if (vm + vl + tr + ss) > 0 else ""
+    xon = {}
+    for line in xd.splitlines():
+        if "|" in line:
+            k, v = line.split("|", 1); xon[k] = _int(v)
+    on_xray = xon.get("vmess", 0) + xon.get("vless", 0) + xon.get("trojan", 0)
+    on_ss = xon.get("ss", 0)
+    on_wg = wg_online()
+    # Même garde-fou que ci-dessus, manquant jusqu'ici : sans compte pour
+    # ce protocole, un pppd résiduel ou un scan quelconque pouvait
+    # apparaître comme un client en ligne (ex. observé : 7 clients L2TP/
+    # PPTP/SSTP fantômes en ligne avec 0 compte créé sur ces protocoles).
+    pd = ppp("online", "all") if (l2 + pp + st) > 0 else ""
+    pon = {}
+    for line in pd.splitlines():
+        if "|" in line:
+            k, v = line.split("|", 1); pon[k] = _int(v)
+    on_l2 = pon.get("l2tp", 0) if l2 > 0 else 0
+    on_pp = pon.get("pptp", 0) if pp > 0 else 0
+    on_st = pon.get("sstp", 0) if st > 0 else 0
+    # Hysteria2 (QUIC) : pas de comptage par session fiable, volontairement
+    # exclu ici aussi (comme dans le panel) plutôt que d'afficher un faux
+    # chiffre.
+    total_on = on_ssh + on_xray + on_ss + on_wg + on_l2 + on_pp + on_st
+
+    # Comptes verrouillés sur TOUS les protocoles, pas seulement SSH —
+    # sinon ce total ne correspondait pas à celui du panel dès qu'un compte
+    # d'un autre protocole était verrouillé.
+    blocked = (ssh_blocked() + blocked_count("vmess") + blocked_count("vless")
+               + blocked_count("trojan") + blocked_count("shadowsocks")
+               + blocked_count("l2tp") + blocked_count("pptp") + blocked_count("sstp")
+               + blocked_count("wireguard", 6) + blocked_count("hysteria"))
+
+    osn = os_name(); cpu = cores()
+    hier, auj, mois = conso_raw()
+
+    # La ligne de fermeture est ajoutée APRÈS coup (+=), jamais collée dans
+    # le même tuple qu'un "* 23" : en Python, des littéraux adjacents comme
+    # "...</code>\n\n" "\u2550" * 23 sont d'abord fusionnés en un seul
+    # texte AVANT que "* 23" ne s'applique — ce qui répétait tout le bloc
+    # (avec la balise </code>) 23 fois, du HTML invalide que Telegram
+    # rejetait silencieusement : le bouton semblait ne "rien faire".
+    txt = (
+        "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
+        "  \U0001F4CA <b>SURVEILLANCE</b>\n"
+        "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D\n\n"
+        "\U0001F5A5 <b>Serveur</b>\n"
+        "<code>"
+        "\u251C OS       %s\n"
+        "\u251C IP       %s\n"
+        "\u251C Domaine  %s\n"
+        "\u251C Uptime   %s\n"
+        "\u251C RAM      %s\n"
+        "\u251C Core     %s\n"
+        "\u2570 Charge   %s"
+        "</code>\n\n"
+        "\U0001F465 <b>Comptes</b>\n"
+        "<code>"
+        "\u251C Total     %d\n"
+        "\u251C En ligne  %d\n"
+        "\u2570 Bloqu\u00e9s   %d"
+        "</code>\n\n"
+        "\U0001F4CA <b>Consommation</b>\n"
+        "<code>"
+        "\u251C Hier         %s\n"
+        "\u251C Aujourd'hui  %s\n"
+        "\u2570 Ce mois      %s"
+        "</code>\n\n"
+    ) % (esc(osn), ip, dom, up, ram, cpu, load, total, total_on, blocked,
+         hr(hier), hr(auj), hr(mois))
+    txt += "\u2550" * 23
+    send(chat, txt)
+
+def do_list(chat):
+    out = cli("list")
+    rows = [l.split("|") for l in out.splitlines() if l.count("|") == 4] if out else []
+    if not rows:
+        send(chat, "\U0001F4CB <b>Comptes SSH</b>\n\n<i>Aucun compte pour le moment.</i>"); return
+    blocks = []
+    for p in rows:
+        user, exp, dev, quota, etat = p[0], p[1], p[2], p[3], p[4]
+        if etat.startswith("verrou"):
+            badge = "\U0001F534"
+        elif etat.startswith("expir"):
+            badge = "\U0001F7E0"
+        else:
+            badge = "\U0001F7E2"
+        q = "illimit\u00e9" if quota in ("0", "") else quota + " Go"
+        ct = conn_time(user)
+        lignes = [
+            "\u251C Expire     %s" % esc(fmt_date(exp)),
+            "\u251C Appareils  %s" % dev,
+            "\u251C Bandwidth  %s" % q,
+        ]
+        if ct:
+            lignes.append("\u251C \u00c9tat       %s %s" % (badge, etat))
+            lignes.append("\u2570 Connect\u00e9   %s" % esc(ct))
+        else:
+            lignes.append("\u2570 \u00c9tat       %s %s" % (badge, etat))
+        blocks.append("\U0001F464 <b>%s</b>\n<code>%s</code>" % (esc(user), "\n".join(lignes)))
+    send(chat, "\U0001F4CB <b>COMPTES SSH</b>  \u00b7  %d\n\n%s" % (len(rows), "\n\n".join(blocks)))
+
+def do_xlist(chat, proto):
+    out = cli("xlist", proto)
+    rows = [l.split("|") for l in out.splitlines() if "|" in l] if (out and not out.startswith("ERR")) else []
+    if not rows:
+        send(chat, "\U0001F4CB <b>%s</b>\n\n<i>Aucun client pour le moment.</i>" % proto.upper(),
+             kb=proto_kb(proto)); return
+    blocks = []
+    for p in rows:
+        name = p[0]; exp = p[1] if len(p) > 1 else "?"
+        etat = p[2] if len(p) > 2 else "actif"
+        # 4e champ de xlist : durée d'activité mesurée via l'API de stats
+        # Xray (échantillonnage du trafic par compte, pas des processus —
+        # possible même si Xray multiplexe tout en 127.0.0.1). "\u2014" si
+        # le compte est verrouillé ou inactif, exactement comme le panel.
+        ct = p[3] if len(p) > 3 else "\u2014"
+        ips = p[4] if len(p) > 4 else "0"
+        if ips.isdigit() and int(ips) > 0:
+            suffix = "%s IP%s" % (ips, "s" if int(ips) > 1 else "")
+            ct = ("%s (%s)" % (ct, suffix)) if ct and ct != "\u2014" else ("(%s)" % suffix)
+        if etat.startswith(("verrou", "expir")):
+            badge = "\U0001F534"
+        else:
+            badge = "\U0001F7E2"
+        lignes = ["\u251C Expire     %s" % esc(fmt_date(exp))]
+        if ct and ct != "\u2014":
+            lignes.append("\u251C \u00c9tat       %s %s" % (badge, etat))
+            lignes.append("\u2570 Connect\u00e9   %s" % esc(ct))
+        else:
+            lignes.append("\u2570 \u00c9tat       %s %s" % (badge, etat))
+        blocks.append("\U0001F464 <b>%s</b>\n<code>%s</code>" % (esc(name), "\n".join(lignes)))
+    send(chat, "\U0001F4CB <b>%s</b>  \u00b7  %d\n\n%s" % (proto.upper(), len(rows), "\n\n".join(blocks)),
+         kb=proto_kb(proto))
+
+def handle_callback(chat, data):
+    # Toute pression sur un bouton annule une action texte en attente,
+    # où qu'on aille dans le menu — pas seulement via "Annuler" ou
+    # "Menu". Les branches qui enchaînent sur une nouvelle action
+    # (ex. "pa:", "hya"...) redéfinissent STATE[chat] juste après, donc
+    # rien n'est perdu pour elles.
+    STATE.pop(chat, None)
+    if data == "menu":
+        show_menu(chat); return
+    if data == "cancel":
+        send(chat, "\u274C Action annul\u00e9e.")
+        return
+    if data == "monitor":
+        do_monitor(chat); return
+    if data == "trial":
+        send(chat, "<b>\U0001F381 Compte test 24 h</b>\nChoisis le protocole :", kb=trial_kb()); return
+    if data == "purge":
+        send(chat, "<b>\U0001F9F9 Purger les comptes expir\u00e9s</b>\nChoisis le protocole :", kb=purge_kb()); return
+    if data.startswith("t:"):
+        p = data[2:]
+        if p == "ssh":
+            n, pw = rand_name(), rand_pass()
+            out = cli("create", n, pw, "1", "1", "0")
+        elif p in ("l2tp", "pptp", "sstp"):
+            n, pw = rand_name(), rand_pass()
+            out = ppp("add", p, n, pw, "1", "1")
+        else:
+            out = cli("xadd", p, rand_name(), "1", "1")
+        if out.startswith("OK"):
+            _box, _key = split_dns_key("\n".join(out.split("\n")[1:]))
+            send(chat, "<b>\u2705 Compte test 24 h cr\u00e9\u00e9</b>\n<pre>%s</pre>%s"
+                 % (esc(_box), dns_key_line(_key)))
+        else:
+            send(chat, "\u274C \u00c9chec : <code>%s</code>" % esc(out))
+        return
+    if data.startswith("g:"):
+        p = data[2:]
+        out = ppp("purge", p, "expired") if p in ("l2tp", "pptp", "sstp") else cli("purge", p, "expired")
+        n = out.split()[1] if out.startswith("OK") and len(out.split()) > 1 else "0"
+        send(chat, "\U0001F9F9 <b>%s</b> : %s compte(s) expir\u00e9(s) supprim\u00e9(s)." % (p.upper(), n)); return
+    if data.startswith("pp:"):
+        p = data[3:]
+        send(chat, "<b>%s</b> \u2014 choisis :" % p.upper(), kb=ppp_kb(p)); return
+    if data.startswith("pl2:"):
+        p = data[4:]
+        rows = ppp("list", p)
+        snap = ppp("snapshot")
+        smap = {}
+        for sr in snap.splitlines():
+            sp = sr.split("|")
+            if len(sp) >= 4 and sp[0] == p:
+                key = sp[1]; smap.setdefault(key, {"ips": set(), "first": 0})
+                smap[key]["ips"].add(sp[2])
+                try:
+                    ts = int(sp[3]); smap[key]["first"] = ts if not smap[key]["first"] else min(smap[key]["first"], ts)
+                except Exception:
+                    pass
+        lignes = []
+        for r in rows.split("\n"):
+            if "|" not in r:
+                continue
+            parts = r.split("|")
+            nm, ex = parts[:2]
+            etat = parts[2] if len(parts) > 2 else "actif"
+            badge = "🔴" if etat.startswith(("verrou", "expir")) else "🟢"
+            info = smap.get(nm, {"ips": set(), "first": 0})
+            n_ip = str(len(info["ips"]))
+            conn = (" · %s IP%s" % (n_ip, "s" if n_ip != "1" else "")) if n_ip != "0" else ""
+            lignes.append("%-16s %-12s %s %s%s" % (nm, fmt_date(ex), badge, etat, conn))
+        send(chat, "<b>\U0001F4CB %s</b>\n<pre>%s</pre>" % (p.upper(), esc("\n".join(lignes) or "aucun compte"))); return
+    if data.startswith("pa2:"):
+        STATE[chat] = {"action": "pppadd", "proto": data[4:]}
+        send(chat, "Envoie : <code>utilisateur motdepasse jours appareils</code>\n<i>0 = illimité</i>", kb=cancel_kb()); return
+    if data.startswith("pd2:"):
+        STATE[chat] = {"action": "pppdel", "proto": data[4:]}
+        send(chat, "Envoie le <b>nom</b> du compte \u00e0 supprimer :", kb=cancel_kb()); return
+    if data.startswith("wg:"):
+        try:
+            with open("/etc/nvpanel/db/wireguard") as f:
+                rows = [l.split() for l in f if l.startswith("### ")]
+            lignes = []
+            today = time.strftime("%Y-%m-%d")
+            for r in rows:
+                if len(r) <= 4:
+                    continue
+                locked = len(r) > 5 and r[5] == "L"
+                expired = bool(r[4] and r[4] <= today)
+                state = "exp+verr" if (locked and expired) else ("verrou" if locked else ("expir\u00e9" if expired else "actif"))
+                ct = "\u2014" if (locked or expired) else (wg_time(r[2]) or "\u2014")
+                lignes.append("%-14s %-12s %-8s %s" % (r[1], fmt_date(r[4]), state, ct))
+            txt = "\n".join(lignes)
+        except Exception:
+            txt = ""
+        send(chat, "<b>\U0001F6E1 WireGuard</b>\n<pre>%s</pre>" % esc(txt or "aucun client")); return
+    if data == "hy:menu":
+        send(chat, "<b>\u26A1 Hysteria2</b> \u2014 choisis :", kb=hy_kb()); return
+    if data == "hyl":
+        rows = hy("list")
+        lignes = []
+        for r in rows.split("\n"):
+            if "|" not in r:
+                continue
+            parts = r.split("|")
+            nm, ex = parts[:2]
+            etat = parts[2] if len(parts) > 2 else "actif"
+            badge = "🔴" if etat.startswith(("verrou", "expir")) else "🟢"
+            lignes.append("%-16s %-12s %s %s" % (nm, fmt_date(ex), badge, etat))
+        send(chat, "<b>\U0001F4CB Hysteria2</b>\n<pre>%s</pre>" % esc("\n".join(lignes) or "aucun compte"), kb=hy_kb()); return
+    if data == "hya":
+        STATE[chat] = {"action": "hyadd"}
+        send(chat, "Envoie : <code>utilisateur motdepasse jours</code>", kb=cancel_kb()); return
+    if data == "hyd":
+        STATE[chat] = {"action": "hydel"}
+        send(chat, "Envoie le <b>nom</b> du compte \u00e0 supprimer :", kb=cancel_kb()); return
+    if data == "list":
+        do_list(chat); return
+    if data == "status":
+        send(chat, "<b>\U0001F5A5 \u00c9tat du serveur</b>\n<code>%s</code>" % cli("status")); return
+    if data.startswith("p:"):
+        p = data[2:]; send(chat, "<b>%s</b> - choisis :" % p.upper(), kb=proto_kb(p)); return
+    if data.startswith("pl:"):
+        do_xlist(chat, data[3:]); return
+    if data.startswith("pa:"):
+        STATE[chat] = {"action": "xadd", "proto": data[3:]}
+        send(chat, "Envoie : <code>nom jours appareils</code>  (ex : <code>client1 30 2</code>)\n<i>0 = illimité</i>", kb=cancel_kb()); return
+    if data.startswith("pd:"):
+        STATE[chat] = {"action": "xdel", "proto": data[3:]}
+        send(chat, "Envoie le <b>nom</b> du client \u00e0 supprimer :", kb=cancel_kb()); return
+    # Ces actions demandent d'abord SUR QUEL PROTOCOLE elles s'appliquent.
+    if data in ("lock", "unlock", "renew"):
+        titre = {"lock": "\U0001F512 Verrouiller un compte",
+                 "unlock": "\U0001F513 D\u00e9verrouiller un compte",
+                 "renew": "\u267B\uFE0F Prolonger un compte"}[data]
+        pref = {"lock": "lk", "unlock": "ul", "renew": "rn"}[data]
+        send(chat, "<b>%s</b>\n\nChoisis le protocole \U0001F447" % titre,
+             kb=proto_choice_kb(pref)); return
+    if data.startswith(("lk:", "ul:", "rn:")):
+        act, _, proto = data.partition(":")
+        nom = PROTO_NAME.get(proto, proto.upper())
+        if act == "rn":
+            STATE[chat] = {"action": "renewdo", "proto": proto}
+            send(chat, "<b>\u267B\uFE0F Prolonger \u2014 %s</b>\n\n"
+                       "Envoie : <code>nom jours</code>\nex : <code>client1 30</code>" % nom,
+                 kb=cancel_kb())
+        else:
+            STATE[chat] = {"action": "lockdo" if act == "lk" else "unlockdo", "proto": proto}
+            verbe = "verrouiller" if act == "lk" else "d\u00e9verrouiller"
+            send(chat, "<b>%s \u2014 %s</b>\n\nEnvoie le <b>nom</b> du compte \u00e0 %s :"
+                 % ("\U0001F512 Verrouiller" if act == "lk" else "\U0001F513 D\u00e9verrouiller", nom, verbe),
+                 kb=cancel_kb())
+        return
+
+    prompts = {
+        "create": "<b>Nouveau compte SSH</b>\n\n<code>nom motdepasse jours [appareils] [bandwidthGo]</code>\n\nex : <code>client1 pass123 30 2 50</code>\n<i>bandwidth en Go, 0 = illimit\u00e9</i>",
+        "delete": "Nom du compte SSH \u00e0 supprimer :",
+    }
+    if data in prompts:
+        STATE[chat] = {"action": data}
+        send(chat, prompts[data], kb=cancel_kb())
+
+def handle_text(chat, text):
+    if not isinstance(text, str) or not text.strip():
+        send(chat, "Envoie un message texte pour continuer, ou /cancel pour annuler.")
+        return
+    if text.strip().lower() in ("annuler", "cancel", "/annuler", "/cancel"):
+        STATE.pop(chat, None)
+        send(chat, "\u274C Action annul\u00e9e.")
+        return
+    st = STATE.pop(chat, None)
+    if not st:
+        show_menu(chat); return
+    a = st["action"]; parts = text.split()
+    if a in ("lockdo", "unlockdo", "delete", "pppdel", "hydel", "xdel") and not parts:
+        STATE[chat] = st
+        send(chat, "Envoie le nom du compte, ou /cancel pour annuler.")
+        return
+    if a == "create":
+        if len(parts) < 3: send(chat, "Format : <code>nom motdepasse jours [appareils] [bandwidthGo]</code>"); return
+        r = cli("create", *parts[:5])
+        if r.startswith("OK"):
+            # La fiche est reprise telle quelle du panel : même présentation
+            # dans le bot et dans le terminal. esc() protège les caractères
+            # spéciaux d'un mot de passe (<, >, &) qui casseraient l'affichage.
+            box, key = split_dns_key("\n".join(r.splitlines()[1:]))
+            send(chat, "\u2705 <b>Compte SSH cr\u00e9\u00e9</b>\n<pre>%s</pre>%s"
+                 % (esc(box), dns_key_line(key)))
+        else:
+            send(chat, "\u274C %s" % r)
+    elif a == "renewdo":
+        # Prolongation, quel que soit le protocole choisi juste avant.
+        p = st.get("proto", "ssh")
+        if len(parts) < 2:
+            send(chat, "Format : <code>nom jours</code>"); return
+        if p == "ssh":
+            r = cli("renew", parts[0], parts[1])
+        elif p in ("l2tp", "pptp", "sstp"):
+            r = ppp("renew", p, parts[0], parts[1])
+        else:
+            r = cli("xrenew", p, parts[0], parts[1])
+        nom = PROTO_NAME.get(p, p.upper())
+        if r.startswith("OK"):
+            send(chat, "\u2705 <b>%s</b> \u2014 %s prolong\u00e9 jusqu'au %s"
+                 % (nom, esc(parts[0]), esc(fmt_date(r.split()[-1]))))
+        else:
+            send(chat, "\u274C <b>%s</b> \u2014 %s" % (nom, esc(r)))
+    elif a in ("lockdo", "unlockdo"):
+        p = st.get("proto", "ssh")
+        verrou = (a == "lockdo")
+        if p == "ssh":
+            r = cli("lock" if verrou else "unlock", parts[0])
+        elif p in ("l2tp", "pptp", "sstp"):
+            r = ppp("lock" if verrou else "unlock", p, parts[0])
+        else:
+            r = cli("xlock" if verrou else "xunlock", p, parts[0])
+        nom = PROTO_NAME.get(p, p.upper())
+        if r.startswith("OK"):
+            send(chat, "%s <b>%s</b> \u2014 %s %s"
+                 % ("\U0001F512" if verrou else "\U0001F513", nom, esc(parts[0]),
+                    "verrouill\u00e9" if verrou else "d\u00e9verrouill\u00e9"))
+        else:
+            send(chat, "\u274C <b>%s</b> \u2014 %s" % (nom, esc(r)))
+    elif a == "delete":
+        r = cli("delete", parts[0])
+        send(chat, ("\u2705 %s supprim\u00e9" % esc(parts[0])) if r.startswith("OK") else ("\u274C %s" % esc(r)))
+    elif a == "pppadd":
+        p = st["proto"]
+        if len(parts) < 2:
+            send(chat, "Format : utilisateur motdepasse jours appareils"); return
+        days = parts[2] if len(parts) > 2 else "30"
+        devices = parts[3] if len(parts) > 3 else "0"
+        r = ppp("add", p, parts[0], parts[1], days, devices)
+        if r.startswith("OK"):
+            send(chat, "\u2705 Compte %s cr\u00e9\u00e9\n<pre>%s</pre>" % (p.upper(), esc("\n".join(r.splitlines()[1:]))))
+        else:
+            send(chat, "\u274C %s" % esc(r))
+    elif a == "pppdel":
+        r = ppp("del", st["proto"], parts[0])
+        send(chat, ("\u2705 %s supprim\u00e9" % parts[0]) if r.startswith("OK") else ("\u274C %s" % esc(r)))
+    elif a == "hyadd":
+        if len(parts) < 2:
+            send(chat, "Format : utilisateur motdepasse jours"); return
+        days = parts[2] if len(parts) > 2 else "30"
+        r = hy("add", parts[0], parts[1], days)
+        if r.startswith("OK"):
+            send(chat, "\u2705 Compte Hysteria2 cr\u00e9\u00e9\n<pre>%s</pre>" % esc("\n".join(r.splitlines()[1:])))
+        else:
+            send(chat, "\u274C %s" % esc(r))
+    elif a == "hydel":
+        r = hy("del", parts[0])
+        send(chat, ("\u2705 %s supprim\u00e9" % esc(parts[0])) if r.startswith("OK") else ("\u274C %s" % esc(r)))
+    elif a == "xadd":
+        proto = st["proto"]
+        if len(parts) < 1: send(chat, "Format : nom jours appareils"); return
+        days = parts[1] if len(parts) > 1 else "30"
+        devices = parts[2] if len(parts) > 2 else "0"
+        out = cli("xadd", proto, parts[0], days, devices)
+        first = out.splitlines()[0] if out else "ERR"
+        if first.startswith("OK"):
+            box = "\n".join(out.splitlines()[1:])
+            send(chat, "\u2705 <b>Client %s cr\u00e9\u00e9</b>\n<pre>%s</pre>" % (proto.upper(), esc(box)))
+        else:
+            send(chat, "\u274C %s" % first)
+    elif a == "xdel":
+        r = cli("xdel", st["proto"], parts[0])
+        send(chat, "\u2705 Supprime" if r.startswith("OK") else ("\u274C %s" % r))
+
+def authorized(uid):
+    return str(uid) == ADMIN
+
+def main():
+    global OFFSET
+    while True:
+        upd = api("getUpdates", offset=OFFSET, timeout=50)
+        if not upd.get("ok"):
+            time.sleep(3); continue
+        for u in upd["result"]:
+            OFFSET = u["update_id"] + 1
+            if "callback_query" in u:
+                cq = u["callback_query"]; uid = cq["from"]["id"]; chat = cq["message"]["chat"]["id"]
+                api("answerCallbackQuery", callback_query_id=cq["id"])
+                if not authorized(uid): api("sendMessage", chat_id=chat, text="\u26D4 Non autorise"); continue
+                handle_callback(chat, cq["data"])
+            elif "message" in u:
+                m = u["message"]; uid = m["from"]["id"]; chat = m["chat"]["id"]
+                if not authorized(uid): api("sendMessage", chat_id=chat, text="\u26D4 Non autorise"); continue
+                txt = m.get("text", "")
+                if txt in ("/start", "/menu"): STATE.pop(chat, None); show_menu(chat)
+                else: handle_text(chat, txt)
+
+if __name__ == "__main__":
+    if not TOKEN or not ADMIN:
+        raise SystemExit("bot.conf incomplet (TOKEN / ADMIN)")
+    # Purge des mises à jour restées en attente côté Telegram (24 h de
+    # rétention). Sans elle, chaque démarrage du service rejouait les anciens
+    # /start et le menu apparaissait plusieurs fois d'affilée.
+    try:
+        _old = api("getUpdates", offset=-1, timeout=0).get("result") or []
+        if _old:
+            OFFSET = _old[-1]["update_id"] + 1
+            api("getUpdates", offset=OFFSET, timeout=0)
+    except Exception:
+        pass
+    if ADMIN:
+        api("sendMessage", chat_id=ADMIN, text=MENU_TXT, parse_mode="HTML", reply_markup=main_kb())
+    while True:
+        try: main()
+        except Exception: time.sleep(5)

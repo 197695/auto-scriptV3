@@ -1,0 +1,156 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · installation Hysteria2   (install-hysteria [auto])
+# ============================================================
+source /etc/nvpanel/lib/ui.sh
+[ "$EUID" -ne 0 ] && { err "Lance en root."; exit 1; }
+umask 077
+AUTO=0; [ "$1" = "auto" ] && AUTO=1
+PORT=443
+DOMAIN=$(cat /etc/nvpanel/domain 2>/dev/null)
+CERT="/etc/letsencrypt/live/$DOMAIN"
+if [ -n "$DOMAIN" ]; then
+  [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] \
+    && [ "${#DOMAIN}" -le 253 ] || { err "Domaine invalide dans /etc/nvpanel/domain."; exit 1; }
+fi
+
+[ "$AUTO" = 1 ] || { banner; center " INSTALLATION HYSTERIA2 " "${BOLD}${WHT}"; line; printf "${CYN}➜${NC} Installation (1 à 2 minutes)…\n"; }
+
+# Hysteria a besoin d'un vrai certificat TLS : on réutilise celui déjà
+# émis par install-tls, jamais une deuxième émission ACME séparée.
+if [ -z "$DOMAIN" ] || [ ! -f "$CERT/fullchain.pem" ] || [ ! -f "$CERT/privkey.pem" ]; then
+  if [ "$AUTO" = 1 ]; then printf "  ${YLW}!${NC} Hysteria nécessite un domaine + TLS (Paramètres 1 puis 2).\n"; exit 1; fi
+  clear; banner; center " ✘  DOMAINE / TLS REQUIS " "${BOLD}${RED}"; line
+  err "Configure d'abord un domaine (Paramètres → 1) puis active le TLS (Paramètres → 2)."
+  pause; exit 1
+fi
+
+_installer=$(mktemp) || { err "Fichier temporaire impossible."; exit 1; }
+if ! curl -fsSL --connect-timeout 15 --max-time 120 https://get.hy2.sh/ -o "$_installer"; then
+  rm -f "$_installer"; err "Téléchargement de Hysteria2 impossible."; exit 1
+fi
+bash "$_installer" > /var/log/nvpanel-hysteria-install.log 2>&1
+_install_rc=$?; rm -f "$_installer"
+
+# Sans cette vérification, un échec de l'installateur officiel (réseau,
+# dépôt injoignable, apt en échec…) passait totalement inaperçu : le
+# script continuait comme si de rien n'était, activait un service sans
+# binaire, et finissait par un message générique « non activé » sans
+# jamais dire pourquoi.
+if [ "$_install_rc" -ne 0 ] || ! command -v hysteria >/dev/null 2>&1; then
+  if [ "$AUTO" = 1 ]; then
+    printf "  ${RED}✘${NC} Installation de Hysteria2 échouée (voir /var/log/nvpanel-hysteria-install.log).\n"
+    exit 1
+  fi
+  clear; banner; center " ✘  INSTALLATION HYSTERIA2 ÉCHOUÉE " "${BOLD}${RED}"; line
+  err "Le binaire Hysteria2 n'a pas pu être installé."
+  printf "\n   ${GRY}Détail : tail -20 /var/log/nvpanel-hysteria-install.log${NC}\n"
+  pause; exit 1
+fi
+systemctl cat hysteria-server >/dev/null 2>&1 \
+  || { err "Le service systemd Hysteria2 n'a pas été installé."; exit 1; }
+id hysteria >/dev/null 2>&1 \
+  || { err "L'utilisateur système Hysteria2 n'a pas été créé."; exit 1; }
+
+# Hysteria tourne sous un utilisateur dédié (pas root) : sans ceci, il ne
+# peut pas lire le certificat Let's Encrypt (dossier root-only par défaut).
+# Les ACL par défaut (-d) garantissent que ça survit aux renouvellements
+# automatiques du certificat dans 90 jours.
+apt-get install -y acl >/dev/null 2>&1 || { err "Installation du support ACL échouée."; exit 1; }
+command -v setfacl >/dev/null 2>&1 || { err "Commande setfacl introuvable."; exit 1; }
+setfacl -R -m u:hysteria:rX /etc/letsencrypt/live/ /etc/letsencrypt/archive/ 2>/dev/null \
+  && find /etc/letsencrypt/live/ /etc/letsencrypt/archive/ -type d \
+       -exec setfacl -m d:u:hysteria:rX {} + 2>/dev/null \
+  || { err "Accès du service Hysteria au certificat TLS impossible."; exit 1; }
+
+mkdir -p /etc/nvpanel/db /etc/hysteria
+touch /etc/nvpanel/db/hysteria
+chmod 700 /etc/nvpanel/db /etc/hysteria 2>/dev/null
+chmod 600 /etc/nvpanel/db/hysteria 2>/dev/null
+
+if [ -x /usr/local/bin/nvpanel-hysteria ]; then
+  /usr/local/bin/nvpanel-hysteria rebuild >/dev/null 2>&1 \
+    || { err "Génération de la configuration Hysteria2 impossible."; exit 1; }
+else
+  # config minimale si nvpanel-hysteria n'est pas encore en place
+  cat > /etc/hysteria/config.yaml <<EOF
+listen: :$PORT
+tls:
+  cert: $CERT/fullchain.pem
+  key: $CERT/privkey.pem
+auth:
+  type: userpass
+  userpass: {}
+masquerade:
+  type: proxy
+  proxy:
+    url: https://news.ycombinator.com/
+    rewriteHost: true
+EOF
+fi
+chmod 600 /etc/hysteria/config.yaml 2>/dev/null
+
+_hy_user=$(systemctl show -p User --value hysteria-server 2>/dev/null); _hy_user=${_hy_user:-hysteria}
+id "$_hy_user" >/dev/null 2>&1 || _hy_user=root
+_hy_group=$(systemctl show -p Group --value hysteria-server 2>/dev/null)
+_hy_group=${_hy_group:-$(id -gn "$_hy_user" 2>/dev/null)}
+[ -n "$_hy_group" ] \
+  || { err "Groupe du service Hysteria2 introuvable."; exit 1; }
+chown root:"$_hy_group" /etc/hysteria /etc/hysteria/config.yaml 2>/dev/null \
+  && chmod 750 /etc/hysteria \
+  && chmod 640 /etc/hysteria/config.yaml \
+  || { err "Droits de lecture de la configuration Hysteria2 impossibles."; exit 1; }
+
+systemctl enable hysteria-server >/dev/null 2>&1 \
+  || { err "Activation du service Hysteria2 impossible."; exit 1; }
+
+# Hysteria refuse de démarrer avec un auth.userpass vide (aucun compte) :
+# on ne force le démarrage que s'il existe déjà au moins un compte.
+HAS_ACCOUNT=0
+grep -q '^### ' /etc/nvpanel/db/hysteria 2>/dev/null && HAS_ACCOUNT=1
+
+if [ "$HAS_ACCOUNT" = 1 ]; then
+  systemctl restart hysteria-server >/dev/null 2>&1
+  sleep 2
+fi
+
+_fw_ok=1
+command -v iptables >/dev/null 2>&1 || _fw_ok=0
+iptables -C INPUT -p udp --dport $PORT -j ACCEPT 2>/dev/null \
+  || iptables -I INPUT -p udp --dport $PORT -j ACCEPT 2>/dev/null || _fw_ok=0
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+  ufw allow $PORT/udp >/dev/null 2>&1 || _fw_ok=0
+fi
+[ "$_fw_ok" -eq 1 ] \
+  && command -v netfilter-persistent >/dev/null 2>&1 \
+  && netfilter-persistent save >/dev/null 2>&1 \
+  || { err "Ouverture ou persistance du pare-feu Hysteria2 impossible."; exit 1; }
+[ -x /usr/local/bin/nvpanel-conso ] && /usr/local/bin/nvpanel-conso setup >/dev/null 2>&1
+
+OK=0
+if systemctl is-active --quiet hysteria-server \
+   && ss -H -lun "sport = :$PORT" 2>/dev/null | grep -q .; then
+  OK=1
+fi
+
+if [ "$AUTO" = 1 ]; then
+  if [ "$OK" = 1 ]; then printf "  ${GRN}✔${NC} Hysteria2 prêt.\n"
+  elif [ "$HAS_ACCOUNT" = 0 ]; then printf "  ${CYN}i${NC} Hysteria2 installé, en attente d'un premier compte.\n"
+  else printf "  ${YLW}!${NC} Hysteria2 non activé.\n"; exit 1; fi
+  exit 0
+fi
+clear; banner
+if [ "$OK" = 1 ]; then
+  center " ✔  HYSTERIA2 OPÉRATIONNEL " "${BOLD}${GRN}"; line
+  ok "Service actif sur le port UDP $PORT."
+  printf "\n   ${GRY}Crée un compte via le menu Hysteria pour obtenir un lien de connexion.${NC}\n"
+elif [ "$HAS_ACCOUNT" = 0 ]; then
+  center " ℹ️  HYSTERIA2 INSTALLÉ " "${BOLD}${CYN}"; line
+  printf "   ${WHT}Binaire, certificat et configuration prêts.${NC}\n"
+  printf "   ${GRY}Le service démarre automatiquement dès la création du premier compte.${NC}\n"
+  printf "   ${GRY}Menu Hysteria2 → 1) Créer un compte.${NC}\n"
+else
+  center " ✘  HYSTERIA2 NON ACTIVÉ " "${BOLD}${RED}"; line
+  err "Le service n'a pas démarré."
+fi
+pause

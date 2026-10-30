@@ -1,0 +1,414 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · mise à jour  (commande : update)
+#  Re-télécharge la dernière version depuis GitHub sans toucher
+#  aux comptes/config, régénère la façade nginx, relance le menu.
+# ============================================================
+REPO_RAW="https://raw.githubusercontent.com/Boblevel/auto-scriptV3/main"
+umask 077
+RED='\033[0;31m'; GRN='\033[0;32m'; CYN='\033[0;36m'; YLW='\033[0;33m'; WHT='\033[1;37m'; GRY='\033[0;90m'; MAG='\033[0;35m'; NC='\033[0m'
+[ "$EUID" -ne 0 ] && { printf "${RED}✘ Lance en root (sudo su -).${NC}\n"; exit 1; }
+[ -d /etc/nvpanel ] || { printf "${RED}✘ SERENE WORLD n'est pas installé.${NC}\n"; exit 1; }
+rm -f /tmp/nvpanel-relaunch 2>/dev/null
+
+# Sauvegarde automatique avant toute mise à jour. Une mise à jour ne doit plus
+# pouvoir modifier les comptes ou statistiques sans point de restauration.
+BACKUP_DIR=/var/backups/rhaff
+BACKUP_FILE="$BACKUP_DIR/pre-update-$(date +%F-%H%M%S).tar.gz"
+mkdir -p "$BACKUP_DIR" || { printf "${RED}✘ Création du dossier de sauvegarde impossible.${NC}\n"; exit 1; }
+chmod 700 "$BACKUP_DIR" 2>/dev/null
+_backup_paths=()
+for _path in etc/nvpanel usr/local/etc/xray etc/nginx/conf.d/rhaff.conf \
+             etc/nginx/nvpanel-ws.conf etc/wireguard etc/ppp etc/hysteria \
+             etc/default/dropbear etc/sysctl.d/99-nvpanel-network.conf \
+             etc/systemd/system/nvpanel-net-tune.service; do
+  [ -e "/$_path" ] && _backup_paths+=("$_path")
+done
+[ "${#_backup_paths[@]}" -gt 0 ] \
+  || { printf "${RED}✘ Aucune donnée du panel à sauvegarder.${NC}\n"; exit 1; }
+_backup_err=$(mktemp /tmp/nvpanel-backup.XXXXXX) \
+  || { printf "${RED}✘ Sauvegarde avant mise à jour échouée.${NC}\n"; exit 1; }
+LC_ALL=C tar -czf "$BACKUP_FILE" -C / "${_backup_paths[@]}" 2>"$_backup_err"
+_backup_rc=$?
+# Les fichiers d'état de /etc/nvpanel peuvent évoluer pendant leur lecture.
+# Ce seul avertissement tar n'invalide pas l'archive ; toute autre erreur reste bloquante.
+if [ "$_backup_rc" -eq 1 ] && [ -s "$_backup_err" ] \
+   && ! grep -Evq '^tar: .*: file changed as we read it$' "$_backup_err"; then
+  _backup_rc=0
+fi
+rm -f "$_backup_err"
+[ "$_backup_rc" -eq 0 ] \
+  && tar -tzf "$BACKUP_FILE" >/dev/null 2>&1 \
+  && chmod 600 "$BACKUP_FILE" \
+  || { rm -f "$BACKUP_FILE"; printf "${RED}✘ Sauvegarde avant mise à jour échouée.${NC}\n"; exit 1; }
+
+clear
+printf "${CYN}"
+cat <<'ART'
+   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+   ┃      R H A F F   S E R V I C E           ┃
+   ┃         M I S E   À   J O U R            ┃
+   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+ART
+printf "${NC}\n"
+
+# ---- Progression horizontale dynamique ---------------------
+# Une seule ligne est réécrite avec \r : 1 → 100 % sans remplir
+# l'historique du terminal ni provoquer les doublons d'affichage.
+_PROGRESS=0
+# Barre volontairement courte : elle reste sur UNE seule ligne même dans les
+# terminaux mobiles étroits. Le retour chariot réécrit cette même ligne.
+_BAR_FULL="####################"
+_BAR_EMPTY="--------------------"
+progress_to(){
+  local target="$1" label="$2" i filled empty bar short
+  [ "$target" -gt 100 ] && target=100
+  case "$label" in
+    *Téléchargement*) short="Téléchargement" ;;
+    *Mise\ en\ place*) short="Installation" ;;
+    *services*) short="Services" ;;
+    *configuration*) short="Configuration" ;;
+    *terminée*) short="Terminé" ;;
+    *) short="$label" ;;
+  esac
+  for ((i=_PROGRESS+1; i<=target; i++)); do
+    filled=$(( i * 20 / 100 )); empty=$((20 - filled))
+    bar="${_BAR_FULL:0:filled}${_BAR_EMPTY:0:empty}"
+    # Bordure fermée de la barre : [################----] reste complète
+    # même pendant la réécriture dynamique sur terminal mobile.
+    printf "\r\033[2K ${CYN}[%s]${NC} ${WHT}%3d%%${NC} ${GRY}%-16s${NC}" "$bar" "$i" "$short"
+    sleep 0.006
+  done
+  _PROGRESS=$target
+}
+progress_to 1 "Préparation"
+
+# Les outils sont requis avant le téléchargement et avant la migration Xray.
+export DEBIAN_FRONTEND=noninteractive
+dpkg -s ca-certificates >/dev/null 2>&1 || apt-get install -y ca-certificates >/dev/null 2>&1
+for _tool_pkg in curl:curl jq:jq openssl:openssl python3:python3 flock:util-linux iptables:iptables ip:iproute2 ss:iproute2 crontab:cron; do
+  _tool=${_tool_pkg%%:*}; _pkg=${_tool_pkg##*:}
+  command -v "$_tool" >/dev/null 2>&1 || apt-get install -y "$_pkg" >/dev/null 2>&1
+done
+if ! command -v netfilter-persistent >/dev/null 2>&1; then
+  echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null
+  echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null
+  apt-get install -y iptables-persistent >/dev/null 2>&1
+fi
+_MISSING=""
+for _t in curl jq openssl python3 flock iptables ip ss crontab netfilter-persistent; do
+  command -v "$_t" >/dev/null 2>&1 || _MISSING="$_MISSING $_t"
+done
+[ -z "$_MISSING" ] || { printf "\n${RED}✘ Outils indispensables absents :%s${NC}\n" "$_MISSING"; exit 1; }
+
+# ---- Téléchargement silencieux, en parallèle contrôlé -------
+# Les composants étaient téléchargés l'un après l'autre : avec 1-2 s de
+# latence GitHub par requête, la mise à jour pouvait prendre près d'une minute
+# avant même l'installation. On télécharge maintenant par lots de 6 dans un
+# dossier temporaire, puis on valide/installe séquentiellement : aucun fichier
+# actif n'est écrasé tant que son téléchargement n'est pas complet.
+FAILED=""; CHANGED=0
+_STAGE=$(mktemp -d /tmp/nvpanel-update.XXXXXX) \
+  || { printf "\n${RED}✘ Préparation du téléchargement impossible.${NC}\n"; exit 1; }
+trap 'rm -rf "$_STAGE" 2>/dev/null' EXIT
+
+_COMPONENTS=(
+  "ui.sh:/etc/nvpanel/lib/ui.sh" "menu:/usr/local/bin/menu" "menu-ssh:/usr/local/bin/menu-ssh"
+  "menu-xray:/usr/local/bin/menu-xray" "menu-ss:/usr/local/bin/menu-ss" "menu-wg:/usr/local/bin/menu-wg"
+  "menu-bot:/usr/local/bin/menu-bot" "menu-settings:/usr/local/bin/menu-settings"
+  "menu-uninstall:/usr/local/bin/menu-uninstall" "nvpanel-cli:/usr/local/bin/nvpanel-cli"
+  "nvpanel-bot:/usr/local/bin/nvpanel-bot" "nvpanel-limit:/usr/local/bin/nvpanel-limit"
+  "nvpanel-net-tune:/usr/local/bin/nvpanel-net-tune"
+  "nvpanel-quota:/usr/local/bin/nvpanel-quota" "nvpanel-clean:/usr/local/bin/nvpanel-clean"
+  "nvpanel-conso:/usr/local/bin/nvpanel-conso"
+  "menu-ppp:/usr/local/bin/menu-ppp" "nvpanel-ppp:/usr/local/bin/nvpanel-ppp"
+  "install-l2tp:/usr/local/bin/install-l2tp" "install-pptp:/usr/local/bin/install-pptp"
+  "install-sstp:/usr/local/bin/install-sstp"
+  "install-xray:/usr/local/bin/install-xray" "install-tls:/usr/local/bin/install-tls"
+  "install-slowdns:/usr/local/bin/install-slowdns" "install-udp:/usr/local/bin/install-udp"
+  "install-hysteria:/usr/local/bin/install-hysteria" "nvpanel-hysteria:/usr/local/bin/nvpanel-hysteria"
+  "update.sh:/usr/local/bin/update"
+)
+
+download_one(){
+  local idx="$1" pair="${_COMPONENTS[$1]}" name dest candidate ok=0
+  name="${pair%%:*}"; dest="${pair##*:}"
+  for candidate in "$name" "$name.txt"; do
+    if curl -fsSL --connect-timeout 15 --max-time 120 "$REPO_RAW/$candidate" -o "$_STAGE/$idx.data" 2>/dev/null \
+       && [ -s "$_STAGE/$idx.data" ] \
+       && ! head -c 200 "$_STAGE/$idx.data" | grep -q '404: Not Found'; then
+      ok=1; break
+    fi
+  done
+  if [ "$ok" = 1 ]; then printf 'ok\n' > "$_STAGE/$idx.status"; else rm -f "$_STAGE/$idx.data"; printf 'fail\n' > "$_STAGE/$idx.status"; fi
+}
+
+progress_to 5 "Téléchargement des composants"
+_TOTAL_FILES=${#_COMPONENTS[@]}
+_BATCH=6
+for ((_base=0; _base<_TOTAL_FILES; _base+=_BATCH)); do
+  _pids=()
+  for ((_j=_base; _j<_base+_BATCH && _j<_TOTAL_FILES; _j++)); do
+    download_one "$_j" & _pids+=("$!")
+  done
+  for _pid in "${_pids[@]}"; do wait "$_pid" 2>/dev/null || true; done
+  _done=$((_base + _BATCH)); [ "$_done" -gt "$_TOTAL_FILES" ] && _done="$_TOTAL_FILES"
+  progress_to $((5 + _done * 60 / _TOTAL_FILES)) "Téléchargement des composants"
+done
+
+# Installation/compare dans le processus principal : les compteurs FAILED et
+# CHANGED restent fiables et aucun sous-processus ne modifie l'état partagé.
+for ((_i=0; _i<_TOTAL_FILES; _i++)); do
+  _pair="${_COMPONENTS[$_i]}"; _name="${_pair%%:*}"; _dest="${_pair##*:}"
+  if [ "$(cat "$_STAGE/$_i.status" 2>/dev/null)" != ok ]; then
+    FAILED="$FAILED $_name"
+    continue
+  fi
+  _tmp="$_STAGE/$_i.data"
+  if [ -f "$_dest" ] && cmp -s "$_tmp" "$_dest" 2>/dev/null; then
+    chmod 700 "$_dest" 2>/dev/null || FAILED="$FAILED $_name"
+  elif chmod 700 "$_tmp" && mv -f "$_tmp" "$_dest"; then
+    CHANGED=$((CHANGED+1))
+  else
+    FAILED="$FAILED $_name"
+  fi
+done
+progress_to 65 "Téléchargement terminé"
+rm -rf "$_STAGE" 2>/dev/null
+trap - EXIT
+
+progress_to 72 "Mise en place des composants"
+command -v qrencode >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode >/dev/null 2>&1
+ln -sf /usr/local/bin/menu /usr/local/bin/acc 2>/dev/null
+ln -sf /usr/local/bin/menu /usr/local/bin/dgh 2>/dev/null
+ln -sf /usr/local/bin/menu-uninstall /usr/local/bin/uninstall 2>/dev/null
+
+progress_to 80 "Mise à jour des services"
+systemctl daemon-reload >/dev/null 2>&1
+CONFIG_FAILED=""
+# Réparer aussi une installation où le paquet Dropbear serait absent.
+command -v dropbear >/dev/null 2>&1 \
+  || apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 install -y dropbear >>/var/log/rhaff-install.log 2>&1
+# Dropbear : ne jamais restaurer un port :22 en conflit avec OpenSSH.
+_db_listening(){
+  ss -H -ltn 2>/dev/null | awk -v p=":$1" '$4 ~ (p "$" ){f=1} END{exit f?0:1}'
+}
+_db_owned(){
+  ss -H -ltnp 2>/dev/null | awk -v p=":$1" '$4 ~ (p "$" ) && /"dropbear"/{f=1} END{exit f?0:1}'
+}
+_db_port_free(){
+  [ "$1" != 22 ] && [ "$1" != "$_db_xport" ] || return 1
+  ! _db_listening "$1" || _db_owned "$1"
+}
+if command -v dropbear >/dev/null 2>&1; then
+  touch /etc/default/dropbear
+  _db_xport=$(cat /etc/nvpanel/xport 2>/dev/null)
+  _db_old_port=$(awk -F= '/^DROPBEAR_PORT=/{gsub(/["[:space:]]/,"",$2); p=$2} END{print p}' /etc/default/dropbear)
+  _db_old_ok=0
+  if [[ "$_db_old_port" =~ ^[0-9]+$ ]] && [ "$_db_old_port" -ne 22 ] \
+     && systemctl is-active --quiet dropbear && _db_owned "$_db_old_port"; then
+    _db_old_ok=1
+  fi
+  if [[ "$_db_old_port" =~ ^[0-9]+$ ]] \
+     && [ "$_db_old_port" -ge 1 ] && [ "$_db_old_port" -le 65535 ] \
+     && [ "$_db_old_port" -ne 22 ] && [ "$_db_old_port" -ne 143 ]; then
+    _db_candidates=("$_db_old_port")
+  else
+    _db_candidates=(143 1443 2222 22222)
+  fi
+  _db_backup=$(mktemp /tmp/rhaff-dropbear-update.XXXXXX) || _db_backup=""
+  _db_ok=0
+  if [ -n "$_db_backup" ] && cp -a /etc/default/dropbear "$_db_backup" 2>/dev/null \
+     && chmod 600 "$_db_backup"; then
+    if systemctl list-unit-files --no-legend dropbear.socket 2>/dev/null | grep -q '^dropbear.socket'; then
+      systemctl disable --now dropbear.socket >/dev/null 2>&1 || CONFIG_FAILED="$CONFIG_FAILED socket-Dropbear"
+    fi
+    systemctl unmask dropbear >/dev/null 2>&1 || CONFIG_FAILED="$CONFIG_FAILED service-Dropbear-masqué"
+    for _db_port in "${_db_candidates[@]}"; do
+      _db_port_free "$_db_port" || continue
+      # Un service sain au bon port ne doit pas être redémarré sans nécessité.
+      if [ "$_db_old_ok" = 1 ] && [ "$_db_port" = "$_db_old_port" ]; then
+        _dropbear_port="$_db_port"; _db_ok=1; break
+      fi
+      sed -i '/^[[:space:]]*NO_START=/d; /^[[:space:]]*DROPBEAR_PORT=/d' /etc/default/dropbear || break
+      printf 'NO_START=0\nDROPBEAR_PORT=%s\n' "$_db_port" >> /etc/default/dropbear
+      grep -q '^DROPBEAR_EXTRA_ARGS=' /etc/default/dropbear \
+        || printf 'DROPBEAR_EXTRA_ARGS=""\n' >> /etc/default/dropbear
+      systemctl reset-failed dropbear >/dev/null 2>&1 || true
+      if systemctl enable dropbear >/dev/null 2>&1 \
+         && systemctl restart dropbear >/dev/null 2>&1 \
+         && systemctl is-active --quiet dropbear \
+         && _db_owned "$_db_port"; then
+        _dropbear_port="$_db_port"; _db_ok=1; break
+      fi
+      systemctl stop dropbear >/dev/null 2>&1 || true
+    done
+    if [ "$_db_ok" -ne 1 ]; then
+      if [ "$_db_old_ok" = 1 ]; then
+        cp -a "$_db_backup" /etc/default/dropbear
+        systemctl reset-failed dropbear >/dev/null 2>&1 || true
+        systemctl restart dropbear >/dev/null 2>&1 || true
+      else
+        systemctl disable --now dropbear >/dev/null 2>&1 || true
+      fi
+      CONFIG_FAILED="$CONFIG_FAILED Dropbear-démarrage (journalctl -u dropbear)"
+    fi
+  else
+    CONFIG_FAILED="$CONFIG_FAILED Dropbear-sauvegarde"
+  fi
+  [ -z "$_db_backup" ] || rm -f "$_db_backup"
+  if [ "$_db_ok" -eq 1 ]; then
+    [ "$_dropbear_port" = 143 ] || printf '\n  ${YLW}! Dropbear utilise %s/tcp.${NC}\n' "$_dropbear_port"
+  fi
+else
+  CONFIG_FAILED="$CONFIG_FAILED Dropbear-absent"
+fi
+if [ "${_db_ok:-0}" = 1 ]; then
+  iptables -C INPUT -p tcp --dport "$_dropbear_port" -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport "$_dropbear_port" -j ACCEPT 2>/dev/null || \
+    CONFIG_FAILED="$CONFIG_FAILED pare-feu-Dropbear"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "$_dropbear_port/tcp" >/dev/null 2>&1 || CONFIG_FAILED="$CONFIG_FAILED UFW-Dropbear"
+  fi
+fi
+# Comptes du panel avec shell /bin/false : sans /bin/false dans /etc/shells,
+# Dropbear rejette l'authentification par mot de passe ("invalid shell,
+# rejected") même avec le bon mot de passe. Corrige aussi les installations
+# déjà en place.
+grep -qxF '/bin/false' /etc/shells 2>/dev/null || echo '/bin/false' >> /etc/shells
+# Le bot Telegram n'est PAS redémarré ici : c'est à toi de le faire
+# depuis le menu (Bot Telegram → « Redémarrer le bot »).
+systemctl is-active --quiet nvpanel-limit && systemctl restart nvpanel-limit >/dev/null 2>&1
+
+progress_to 90 "Application de la configuration"
+
+# --- Message d'accueil du serveur (MOTD) ---------------------------------
+# Ubuntu et Debian affichent au login un long texte : bannière de la
+# distribution, publicités, message de l'hébergeur (Contabo, OVH…).
+# Il s'imprime AVANT le panel et reste visible quand on fait défiler.
+# Le fichier .hushlogin le désactive proprement, sans rien supprimer :
+# il suffit de l'effacer pour retrouver le message d'origine.
+touch /root/.hushlogin 2>/dev/null
+[ -n "${SUDO_USER:-}" ] && [ -d "/home/${SUDO_USER}" ] && \
+  touch "/home/${SUDO_USER}/.hushlogin" 2>/dev/null
+
+# Réglages réseau ciblés : buffers UDP + RPS/RFS sur NIC mono-file.
+# Le redémarrage SlowDNS n'est fait que lors du premier changement du buffer
+# par défaut afin que son socket UDP persistant récupère la nouvelle valeur.
+_nv_old_rmem=$(sysctl -n net.core.rmem_default 2>/dev/null || echo 0)
+if [ -x /usr/local/bin/nvpanel-net-tune ]; then
+  if /usr/local/bin/nvpanel-net-tune install >>/var/log/rhaff-install.log 2>&1; then
+    if [ "$_nv_old_rmem" != "1048576" ] && systemctl is-active --quiet nvpanel-slowdns 2>/dev/null; then
+      systemctl restart nvpanel-slowdns >/dev/null 2>&1 \
+        || CONFIG_FAILED="$CONFIG_FAILED SlowDNS-buffer"
+    fi
+  else
+    printf 'RHAFF : optimisation réseau facultative indisponible sur ce VPS.\n' >>/var/log/rhaff-install.log
+  fi
+fi
+
+if [ -x /usr/local/bin/install-xray ]; then
+  /usr/local/bin/install-xray auto >/dev/null 2>&1 || CONFIG_FAILED="$CONFIG_FAILED Xray"
+else
+  CONFIG_FAILED="$CONFIG_FAILED Xray"
+fi
+# compteur de consommation CLIENTS (exclut le trafic propre du serveur)
+if [ -x /usr/local/bin/nvpanel-conso ]; then
+  /usr/local/bin/nvpanel-conso setup >/dev/null 2>&1 || CONFIG_FAILED="$CONFIG_FAILED consommation"
+  ( crontab -l 2>/dev/null | grep -v nvpanel-conso; echo "*/5 * * * * /usr/local/bin/nvpanel-conso poll" ) | crontab - 2>/dev/null \
+    || CONFIG_FAILED="$CONFIG_FAILED cron-consommation"
+fi
+# statistiques par compte Xray : ajoutées à une configuration existante sans
+# jamais toucher aux clients déjà créés, puis relevé d'activité à la minute
+if [ -x /usr/local/bin/nvpanel-cli ]; then
+  /usr/local/bin/nvpanel-cli xapi >/dev/null 2>&1 || CONFIG_FAILED="$CONFIG_FAILED API-Xray"
+  ( crontab -l 2>/dev/null | grep -v 'nvpanel-cli xsample'; echo "* * * * * /usr/local/bin/nvpanel-cli xsample" ) | crontab - 2>/dev/null \
+    || CONFIG_FAILED="$CONFIG_FAILED cron-Xray"
+
+  # La limite Xray/Shadowsocks doit réagir en quelques secondes. Ce service
+  # n'agit ni sur SSH ni sur SlowDNS.
+  cat > /etc/systemd/system/nvpanel-xlimit.service <<'UNIT'
+[Unit]
+Description=RHAFF SERVICE - limite appareils Xray/SS
+After=network-online.target xray.service nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'while true; do /usr/local/bin/nvpanel-cli xenforce >/dev/null 2>&1; sleep 5; done'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now nvpanel-xlimit >/dev/null 2>&1 \
+    && systemctl is-active --quiet nvpanel-xlimit \
+    || CONFIG_FAILED="$CONFIG_FAILED limite-Xray"
+fi
+# udp-custom : bascule de l'ancien port 36712 vers l'UDP 22, afin que le client
+# saisisse le même port pour SSH, SlowDns et UDP Custom
+if [ -f /etc/nvpanel/udp/config.json ] && grep -q '":36712"' /etc/nvpanel/udp/config.json 2>/dev/null; then
+  sed -i 's/":36712"/":22"/' /etc/nvpanel/udp/config.json 2>/dev/null
+  iptables -D INPUT -p udp --dport 36712 -j ACCEPT 2>/dev/null
+  iptables -C INPUT -p udp --dport 22 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p udp --dport 22 -j ACCEPT 2>/dev/null
+  systemctl restart nvpanel-udp-custom >/dev/null 2>&1
+  [ -x /usr/local/bin/nvpanel-conso ] && /usr/local/bin/nvpanel-conso setup >/dev/null 2>&1
+fi
+netfilter-persistent save >/dev/null 2>&1 || CONFIG_FAILED="$CONFIG_FAILED pare-feu"
+progress_to 100 "Mise à jour terminée"
+printf "\n"
+
+clear
+if [ "$CHANGED" -eq 0 ] && [ -z "$FAILED" ]; then
+  printf "${GRN}"
+  cat <<'UPTODATE'
+   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+   ┃      ✔   Le script est déjà à jour       ┃
+   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+UPTODATE
+  printf "${NC}\n"
+  printf "   ${GRY}Aucun composant n'a changé depuis la dernière mise à jour.${NC}\n\n"
+else
+  printf "${GRN}"
+  cat <<'DONE'
+   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+   ┃       ✔   Mise à jour terminée           ┃
+   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+DONE
+  printf "${NC}\n"
+  [ -z "$FAILED" ] && printf "   ${GRY}Le script est maintenant à jour (%s composant(s) mis à jour).${NC}\n\n" "$CHANGED"
+fi
+if [ -n "$FAILED" ]; then
+  printf "   ${YLW}⚠ Mise à jour partielle : certains composants n'ont pas pu être${NC}\n"
+  printf "   ${YLW}  récupérés.${NC} ${GRY}Vérifie la connexion du serveur et relance : update${NC}\n\n"
+fi
+if [ -n "$CONFIG_FAILED" ]; then
+  printf "   ${YLW}⚠ Configuration non appliquée :%s.${NC}\n" "$CONFIG_FAILED"
+  printf "   ${GRY}  Consulte les journaux systemd, corrige la cause puis relance : update${NC}\n\n"
+fi
+printf "   ${GRY}Sauvegarde avant mise à jour :${NC} %s\n\n" "$BACKUP_FILE"
+# Le bot partage les mêmes commandes que le panel. S'il tourne déjà, on le
+# redémarre après la mise à jour afin qu'il charge immédiatement les fichiers
+# qui viennent d'être remplacés, sans modifier son état activé/désactivé.
+if systemctl is-active --quiet nvpanel-bot 2>/dev/null; then
+  systemctl restart nvpanel-bot >/dev/null 2>&1 || true
+fi
+printf "   ${GRY}Ouverture du menu…${NC}\n"
+sleep 1
+# vide les touches tapées pendant la mise à jour (sinon elles ressortent en ^[[A)
+while IFS= read -r -s -t 0.01 -n 512 _ 2>/dev/null; do :; done
+
+# Lancé depuis le panel : signale au menu principal qu'il doit se remplacer
+# par la nouvelle version une fois le sous-menu Paramètres refermé. On évite
+# ainsi tout empilement de menus tout en rechargeant immédiatement les fichiers.
+_UPDATE_RC=0
+[ -n "$FAILED$CONFIG_FAILED" ] && _UPDATE_RC=1
+if [ -n "${NVPANEL_UI:-}" ]; then
+  : > /tmp/nvpanel-relaunch
+  exit "$_UPDATE_RC"
+fi
+[ "$_UPDATE_RC" -eq 0 ] || exit "$_UPDATE_RC"
+exec menu

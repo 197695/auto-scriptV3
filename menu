@@ -1,0 +1,141 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · menu principal   (commandes : menu / acc / dgh)
+# ============================================================
+source /etc/nvpanel/lib/ui.sh
+ui_enter; trap ui_leave EXIT INT TERM HUP
+
+run() {
+  if command -v "$1" >/dev/null 2>&1; then
+    "$@"
+    if [ -e /tmp/nvpanel-relaunch ]; then
+      rm -f /tmp/nvpanel-relaunch
+      exec /usr/local/bin/menu
+    fi
+  else clear; banner; warn "Module « $1 » en préparation (bientôt disponible)."; pause; fi
+}
+
+# Encadrement du menu d'accueil uniquement. Les trois anciennes lignes de
+# séparation sont réutilisées comme haut / milieu / bas du cadre : aucune
+# ligne supplémentaire, afin de respecter la hauteur des terminaux mobiles.
+home_top(){ _edge "┏" "┓" "PROTOCOLES & SERVICES"; }
+home_mid(){ _edge "┣" "┫" "OUTILS & ADMINISTRATION"; }
+home_bot(){ bot; }
+section_panel(){
+  top
+  center "$1" "${BOLD}${WHT}"
+  bot
+}
+
+home_entry(){
+  local n="$1" e="$2" t="$3"
+  printf "${CYN}┃${NC} ${GRN}[%s]${NC} %s ${WHT}%s${NC}" "$n" "$e" "$(_upper "$t")"
+  printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+}
+
+services_status() {
+  banner; section_panel " 📊  STATUT DES SERVICES "
+  local s name
+  for pair in \
+    "ssh:SSH (OpenSSH)" "dropbear:Dropbear" "xray:Xray (Vmess/Vless/Trojan/SS)" \
+    "nginx:Nginx (façade TLS/WS)" "nvpanel-slowdns:SlowDNS" "nvpanel-badvpn-7300:UDP (badvpn)" \
+    "wg-quick@wg0:WireGuard" "xl2tpd:L2TP (xl2tpd)" "strongswan-starter:L2TP (IPsec)" \
+    "pptpd:PPTP" "nvpanel-sstp:SSTP" "nvpanel-limit:Limite d'appareils" "nvpanel-bot:Bot Telegram"; do
+    s="${pair%%:*}"; name="${pair##*:}"
+    if systemctl is-active --quiet "$s" 2>/dev/null; then
+      printf "   ${GRN}● actif  ${NC} %s\n" "$name"
+    else
+      printf "   ${RED}○ arrêté ${NC} ${GRY}%s${NC}\n" "$name"
+    fi
+  done
+  echo
+  printf "   ${GRY}● = en cours   ○ = arrêté / non installé${NC}\n"
+  pause
+}
+
+reboot_server() {
+  banner; section_panel " 🔁  REDÉMARRAGE DU SERVEUR "
+  warn "Le serveur va redémarrer. Ta session SSH sera coupée quelques instants."
+  ask " Confirmer le redémarrage ? (o/n) : " r
+  if confirm "$r"; then
+    printf "${YLW}Redémarrage en cours…${NC}\n"; sleep 1; reboot
+  fi
+}
+
+optimize_server() {
+  banner; section_panel " 🚀  OPTIMISATION DU SERVEUR "
+  printf "   ${GRY}Nettoyage sûr (n'affecte ni les comptes ni la config)…${NC}\n\n"
+  local ram_b disk_b ram_a disk_a rf df_
+  ram_b=$(free -m | awk '/Mem:/{print $3}')
+  disk_b=$(df -m / | awk 'NR==2{print $3}')
+  printf "   ${CYN}➜${NC} Cache APT…\n"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -y clean >/dev/null 2>&1
+  apt-get -y autoclean >/dev/null 2>&1
+  printf "   ${CYN}➜${NC} Rotation des journaux système…\n"
+  journalctl --vacuum-time=3d >/dev/null 2>&1
+  journalctl --vacuum-size=50M >/dev/null 2>&1
+  printf "   ${CYN}➜${NC} Fichiers temporaires…\n"
+  command -v systemd-tmpfiles >/dev/null 2>&1 && systemd-tmpfiles --clean >/dev/null 2>&1
+  find /tmp -maxdepth 1 -type f -name 'nvpanel-*' -mtime +2 -delete 2>/dev/null
+  printf "   ${CYN}➜${NC} Libération de la mémoire (caches)…\n"
+  sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+  ram_a=$(free -m | awk '/Mem:/{print $3}')
+  disk_a=$(df -m / | awk 'NR==2{print $3}')
+  rf=$(( ram_b - ram_a ));  [ "$rf" -lt 0 ] && rf=0
+  df_=$(( disk_b - disk_a )); [ "$df_" -lt 0 ] && df_=0
+  echo; ok "Serveur optimisé et nettoyé."
+  printf "   ${GRY}RAM libérée   :${NC} ${WHT}%s Mo${NC}  ${GRY}(%s → %s Mo utilisés)${NC}\n" "$rf" "$ram_b" "$ram_a"
+  printf "   ${GRY}Disque libéré :${NC} ${WHT}%s Mo${NC}  ${GRY}(%s → %s Mo utilisés)${NC}\n" "$df_" "$disk_b" "$disk_a"
+  pause
+}
+
+# À la première ouverture explicite de `menu`, on force une mesure fraîche.
+# Aux retours depuis les sous-menus, l'interface réutilise le cache très court
+# et le rafraîchit en arrière-plan afin que la navigation reste instantanée.
+_HOME_FIRST=1
+while true; do
+  if [ "$_HOME_FIRST" = 1 ]; then
+    infobox fresh
+    _HOME_FIRST=0
+  else
+    infobox
+  fi
+  home_top
+  home_entry "01" "🔒" "SSH · SlowDNS · UDP"
+  home_entry "02" "🌐" "Menu · L2TP"
+  home_entry "03" "📡" "Menu · PPTP"
+  home_entry "04" "🔐" "Menu · SSTP"
+  home_entry "05" "🟣" "Xray · Vmess"
+  home_entry "06" "🔵" "Xray · Vless"
+  home_entry "07" "🟠" "Xray · Trojan"
+  home_entry "08" "🟢" "Menu · Shadowsocks"
+  home_entry "09" "🔰" "Menu · WireGuard"
+  home_mid
+  home_entry "10" "🤖" "Bot Telegram"
+  home_entry "11" "📈" "Statut des services"
+  home_entry "12" "⚙️" "Paramètres"
+  home_entry "13" "🔁" "Redémarrer le serveur"
+  home_entry "14" "🚀" "Optimiser le serveur"
+  home_entry "00" "🚪" "Quitter"
+  home_bot
+  ask "$(printf " ${WHT}➤ Choix :${NC} ")" opt || { clear; exit 0; }
+  case "$opt" in
+    01|1) run menu-ssh ;;
+    02|2) run menu-ppp l2tp ;;
+    03|3) run menu-ppp pptp ;;
+    04|4) run menu-ppp sstp ;;
+    05|5) run menu-xray vmess ;;
+    06|6) run menu-xray vless ;;
+    07|7) run menu-xray trojan ;;
+    08|8) run menu-ss ;;
+    09|9) run menu-wg ;;
+    10)   run menu-bot ;;
+    11)   loading "Analyse des services"; services_status ;;
+    12)   loading "Ouverture des paramètres"; run menu-settings ;;
+    13)   reboot_server ;;
+    14)   optimize_server ;;
+    00|0) clear; exit 0 ;;
+    *)    warn "Option invalide"; sleep 1 ;;
+  esac
+done

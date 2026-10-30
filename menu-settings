@@ -1,0 +1,517 @@
+#!/bin/bash
+# ============================================================
+#  RHAFF SERVICE · Paramètres système   (commande : menu-settings)
+# ============================================================
+source /etc/nvpanel/lib/ui.sh
+ui_enter; trap ui_leave EXIT INT TERM HUP
+[ "$EUID" -ne 0 ] && { err "Lance en root."; exit 1; }
+BKDIR=/root
+umask 077
+
+section_panel(){
+  top
+  center "$1" "${BOLD}${WHT}"
+  bot
+}
+header(){ banner; section_panel " ⚙️  PARAMÈTRES SYSTÈME "; }
+valid_domain(){
+  local d="$1" label
+  [ "${#d}" -le 253 ] && [[ "$d" == *.* ]] && [[ "$d" != *..* ]] || return 1
+  IFS='.' read -r -a _labels <<< "$d"
+  for label in "${_labels[@]}"; do
+    [ "${#label}" -ge 1 ] && [ "${#label}" -le 63 ] || return 1
+    [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+  done
+}
+
+traffic_report(){
+  local LC_ALL=C.UTF-8
+  header; section_panel " 📊  BILAN DU TRAFIC — TOUS PROTOCOLES "
+  # Le bilan affiche immédiatement le dernier historique validé. Le relevé
+  # iptables est déclenché en arrière-plan par la bibliothèque UI afin que
+  # l'ouverture de cette option ne reste plus bloquée plusieurs secondes.
+  _conso_refresh_async
+  local DB=/etc/nvpanel/db/conso
+  [ -s "$DB" ] || { echo; warn "Aucune donnée de consommation pour l'instant."; pause; return; }
+
+  local year today_str week month yearsum days_tracked start_date
+  year=$(date +%Y); today_str=$(date +%F)
+  # "%.0f" et non "%d" : sur mawk (awk par défaut sur Debian/Ubuntu), "%d"
+  # convertit la somme via un entier 32 bits et déborde au-delà de 4 Go —
+  # exactement le bug déjà corrigé dans nvpanel-conso, mais cette fonction
+  # réimplémentait sa propre somme séparée, jamais mise à jour à l'époque.
+  # "%.0f" passe par le formatage flottant natif d'awk, sans cette limite.
+  local todaysum
+  todaysum=$(awk -F'|' -v d="$today_str" '$1==d{s+=$2} END{printf "%.0f", s+0}' "$DB" 2>/dev/null)
+  week=$(awk -F'|' -v lim="$(date -d '-7 days' +%F 2>/dev/null)" '$1>=lim{s+=$2} END{printf "%.0f", s+0}' "$DB" 2>/dev/null)
+  month=$(awk -F'|' -v p="$(date +%Y-%m)" 'index($1,p)==1{s+=$2} END{printf "%.0f", s+0}' "$DB" 2>/dev/null)
+  yearsum=$(awk -F'|' -v p="$year" 'index($1,p)==1{s+=$2} END{printf "%.0f", s+0}' "$DB" 2>/dev/null)
+  days_tracked=$(wc -l < "$DB" 2>/dev/null); days_tracked=${days_tracked:-0}
+  start_date=$(head -1 "$DB" 2>/dev/null | cut -d'|' -f1)
+
+  # Padding calculé à la main (et non via printf "%-Ns") : "%-Ns" compte des
+  # OCTETS, pas des caractères — un accent comme le "é" d'« année » occupe
+  # 2 octets en UTF-8 pour 1 seul caractère affiché, ce qui décalait cette
+  # ligne d'une colonne par rapport aux autres. ${#s} sous LC_ALL=C.UTF-8
+  # compte, lui, le vrai nombre de caractères, donc l'alignement reste
+  # correct quel que soit le contenu.
+  local w=20 lbl0 lbl1 lbl2 lbl3
+  lbl0="Aujourd'hui"; lbl1="7 derniers jours"; lbl2="Ce mois-ci"; lbl3="Cette année ($year)"
+
+  echo
+  printf "   ${CYN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}\n"
+  printf "   ${CYN}┃${NC} ${GRY}▸${NC} %s%*s${WHT}%11s${NC}  ${CYN}┃${NC}\n" "$lbl0" $((w-${#lbl0})) "" "$(_hr "${todaysum:-0}")"
+  printf "   ${CYN}┃${NC} ${GRY}▸${NC} %s%*s${WHT}%11s${NC}  ${CYN}┃${NC}\n" "$lbl1" $((w-${#lbl1})) "" "$(_hr "${week:-0}")"
+  printf "   ${CYN}┃${NC} ${GRY}▸${NC} %s%*s${WHT}%11s${NC}  ${CYN}┃${NC}\n" "$lbl2" $((w-${#lbl2})) "" "$(_hr "${month:-0}")"
+  printf "   ${CYN}┃${NC} ${GRY}▸${NC} %s%*s${WHT}%11s${NC}  ${CYN}┃${NC}\n" "$lbl3" $((w-${#lbl3})) "" "$(_hr "${yearsum:-0}")"
+  printf "   ${CYN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}\n"
+  echo
+  # Explique pourquoi semaine/mois/année peuvent afficher le même chiffre :
+  # tant que le suivi n'a pas plus de 7 jours d'historique, c'est normal et
+  # mathématique — plutôt que de laisser un chiffre identique sans
+  # explication, la période réellement couverte est maintenant affichée.
+  if [ -n "$start_date" ]; then
+    printf "   ${GRY}Suivi depuis le %s · %s jour(s) d'historique${NC}\n" "$(_fmtd "$start_date")" "$days_tracked"
+  fi
+  pause
+}
+
+set_domain(){
+  header; section_panel " 🌐  DOMAINE DU SERVEUR "
+  printf "   ${GRY}Actuel :${NC} %s\n\n" "$(cat /etc/nvpanel/domain 2>/dev/null || echo 'non configuré')"
+  ask " Domaine complet (ex. vpn.mondomaine.com) : " d
+  d=$(printf '%s' "$d" | tr -d '\r\n\t ' | tr 'A-Z' 'a-z')
+  [ -z "$d" ] && { warn "Inchangé"; pause; return; }
+  valid_domain "$d" || { err "Domaine invalide (FQDN attendu, ex. vpn.mondomaine.com)."; pause; return; }
+  local old_domain
+  old_domain=$(cat /etc/nvpanel/domain 2>/dev/null)
+  printf '%s\n' "$d" > /etc/nvpanel/domain
+  chmod 600 /etc/nvpanel/domain 2>/dev/null
+  ok "Domaine enregistré : $d"
+  echo
+
+  # --- Propagation vers les modules qui dépendent du domaine ---
+  # Sans ceci, SlowDNS garde l'ancien nom (il est inscrit dans son service).
+  if systemctl is-active --quiet nvpanel-slowdns 2>/dev/null || [ -s /etc/nvpanel/slowdns/dns-server ]; then
+    printf "${CYN}➜${NC} Reconfiguration de SlowDNS (ns-%s)…\n" "$d"
+    /usr/local/bin/install-slowdns auto "ns-$d" >/dev/null 2>&1
+    if systemctl is-active --quiet nvpanel-slowdns 2>/dev/null; then
+      ok "SlowDNS mis à jour."
+    else
+      warn "SlowDNS n'a pas redémarré — réinstalle-le depuis le menu SSH."
+    fi
+  fi
+  if command -v xray >/dev/null 2>&1 && [ -x /usr/local/bin/install-xray ]; then
+    printf "${CYN}➜${NC} Mise à jour de la façade web…\n"
+    if /usr/local/bin/install-xray auto >/dev/null 2>&1; then
+      ok "Façade web mise à jour."
+    else
+      if [ -n "$old_domain" ]; then printf '%s\n' "$old_domain" > /etc/nvpanel/domain; else rm -f /etc/nvpanel/domain; fi
+      /usr/local/bin/install-xray auto >/dev/null 2>&1 || true
+      if [ -n "$old_domain" ]; then
+        /usr/local/bin/install-slowdns auto "ns-$old_domain" >/dev/null 2>&1 || true
+      else
+        systemctl stop nvpanel-slowdns >/dev/null 2>&1 || true
+        iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null
+        iptables -D INPUT -p udp --dport 5300 -j ACCEPT 2>/dev/null
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+      fi
+      err "La façade web a refusé le nouveau domaine : modification annulée."
+      pause; return
+    fi
+  fi
+  if [ -f "/etc/letsencrypt/live/$d/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/$d/privkey.pem" ]; then
+    touch /etc/nvpanel/tls_on; chmod 600 /etc/nvpanel/tls_on 2>/dev/null
+    if [ -x /usr/local/bin/nvpanel-hysteria ] && grep -q '^### ' /etc/nvpanel/db/hysteria 2>/dev/null; then
+      /usr/local/bin/nvpanel-hysteria rebuild >/dev/null 2>&1 \
+        || warn "Hysteria2 n'a pas pu appliquer le certificat de ce domaine."
+    fi
+    if systemctl is-active --quiet nvpanel-sstp 2>/dev/null && [ -x /usr/local/bin/install-sstp ]; then
+      /usr/local/bin/install-sstp auto >/dev/null 2>&1 \
+        || warn "SSTP n'a pas pu appliquer le certificat de ce domaine."
+    fi
+  else
+    rm -f /etc/nvpanel/tls_on
+    warn "Le TLS officiel doit être réactivé pour ce nouveau domaine (option 2)."
+  fi
+  echo
+  printf "   ${YLW}Les comptes déjà créés doivent être ré-envoyés (option « Revoir un compte »).${NC}\n"
+  pause
+}
+change_port(){
+  local old backup fw_added=0 fw_ok=1
+  old=$(awk -F= '/^DROPBEAR_PORT=/{gsub(/["[:space:]]/,"",$2); p=$2} END{print p}' /etc/default/dropbear 2>/dev/null); old=${old:-143}
+  header; printf " ${GRY}Port Dropbear actuel :${NC} %s\n" "$old"
+  ask " Nouveau port Dropbear : " p
+  [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || { err "Port invalide (1 à 65535)."; pause; return; }
+  if [ "$p" != "$old" ] && ss -H -ltn 2>/dev/null | awk -v p=":$p" '$4 ~ (p "$"){f=1} END{exit f?0:1}'; then
+    err "Le port $p est déjà utilisé par un autre service."; pause; return
+  fi
+  backup=$(mktemp) || { err "Sauvegarde temporaire impossible."; pause; return; }
+  cp -a /etc/default/dropbear "$backup" 2>/dev/null || { rm -f "$backup"; err "Configuration Dropbear introuvable."; pause; return; }
+  if grep -q '^DROPBEAR_PORT=' /etc/default/dropbear 2>/dev/null; then
+    sed -i "s/^DROPBEAR_PORT=.*/DROPBEAR_PORT=$p/" /etc/default/dropbear
+  else echo "DROPBEAR_PORT=$p" >> /etc/default/dropbear; fi
+  if systemctl restart dropbear >/dev/null 2>&1 && systemctl is-active --quiet dropbear \
+     && ss -H -ltn 2>/dev/null | awk -v p=":$p" '$4 ~ (p "$"){f=1} END{exit f?0:1}'; then
+    if ! iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+      iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null && fw_added=1 || fw_ok=0
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw allow "$p/tcp" >/dev/null 2>&1 || fw_ok=0
+    fi
+    command -v netfilter-persistent >/dev/null 2>&1 \
+      && netfilter-persistent save >/dev/null 2>&1 || fw_ok=0
+    if [ "$fw_ok" != 1 ]; then
+      [ "$fw_added" = 1 ] && iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null
+      if [ "$p" != "$old" ] && command -v ufw >/dev/null 2>&1; then
+        ufw --force delete allow "$p/tcp" >/dev/null 2>&1
+      fi
+      cp -a "$backup" /etc/default/dropbear 2>/dev/null; rm -f "$backup"
+      systemctl restart dropbear >/dev/null 2>&1 || true
+      err "Pare-feu non appliqué ou non persistant : ancien port $old restauré."
+      pause; return
+    fi
+    if [ "$p" != "$old" ] && [ "$old" != 22 ]; then
+      iptables -D INPUT -p tcp --dport "$old" -j ACCEPT 2>/dev/null
+      command -v ufw >/dev/null 2>&1 && ufw --force delete allow "$old/tcp" >/dev/null 2>&1
+    fi
+    netfilter-persistent save >/dev/null 2>&1 \
+      || warn "Le nouveau port est persistant, mais l'ancienne règle de pare-feu pourra réapparaître au redémarrage."
+    rm -f "$backup"
+    ok "Port Dropbear : $p"
+  else
+    cp -a "$backup" /etc/default/dropbear 2>/dev/null; rm -f "$backup"
+    systemctl restart dropbear >/dev/null 2>&1 || true
+    err "Dropbear n'a pas démarré sur $p : ancien port $old restauré."
+  fi
+  pause
+}
+backup_now(){
+  header; local f="$BKDIR/rhaff-backup-$(date +%F-%H%M).tar.gz" paths=()
+  [ -e /etc/nvpanel ] && paths+=(etc/nvpanel)
+  [ -e /usr/local/etc/xray ] && paths+=(usr/local/etc/xray)
+  [ -e /etc/wireguard/wg0.conf ] && paths+=(etc/wireguard/wg0.conf)
+  [ "${#paths[@]}" -gt 0 ] || { err "Aucune donnée du panel à sauvegarder."; pause; return; }
+  if tar czf "$f" -C / "${paths[@]}" 2>/dev/null && tar tzf "$f" >/dev/null 2>&1; then
+    chmod 600 "$f" 2>/dev/null; ok "Sauvegarde créée : $f"
+  else
+    rm -f "$f"; err "La sauvegarde a échoué."
+  fi
+  pause
+}
+restore_data(){
+  header; local files=("$BKDIR"/rhaff-backup-*.tar.gz)
+  [ -e "${files[0]}" ] || { err "Aucune sauvegarde trouvée"; pause; return; }
+  local i=1; for f in "${files[@]}"; do printf "  ${GRN}%s)${NC} %s\n" "$i" "$(basename "$f")"; i=$((i+1)); done
+  ask " Numéro à restaurer : " n
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#files[@]}" ] || { err "Choix invalide"; pause; return; }
+  local sel="${files[$((n-1))]}"
+  [ -f "$sel" ] || { err "Choix invalide"; pause; return; }
+  tar tzf "$sel" >/dev/null 2>&1 || { err "Archive de sauvegarde corrompue."; pause; return; }
+  if tar xzf "$sel" -C /; then ok "Restauré depuis $(basename "$sel")"; else err "Restauration échouée."; fi
+  pause
+}
+ram_usage(){ header; free -h; echo; command -v vnstat >/dev/null && vnstat --oneline 2>/dev/null; pause; }
+swap_ram(){
+  header; ask " Taille du swap en Mo (ex. 1024) : " s
+  [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 64 ] && [ "$s" -le 65536 ] || { err "Taille invalide (64 à 65536 Mo)."; pause; return; }
+  swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile' && { warn "/swapfile est déjà actif : aucune modification."; pause; return; }
+  [ ! -e /swapfile ] || { err "/swapfile existe déjà : suppression manuelle requise avant remplacement."; pause; return; }
+  local avail; avail=$(df -Pm / | awk 'NR==2{print $4}')
+  [ -n "$avail" ] && [ "$avail" -gt $((s + 256)) ] || { err "Espace disque insuffisant pour ${s} Mo de swap."; pause; return; }
+  fallocate -l "${s}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$s" status=none 2>/dev/null \
+    || { rm -f /swapfile; err "Création du fichier swap échouée."; pause; return; }
+  chmod 600 /swapfile
+  if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
+    grep -qE '^[^#]*[[:space:]]/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    ok "Swap de ${s} Mo activé."
+  else
+    rm -f /swapfile; err "Activation du swap échouée."
+  fi
+  pause
+}
+enable_bbr(){
+  header
+  grep -q 'net.core.default_qdisc=fq' /etc/sysctl.conf || echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
+  grep -q 'tcp_congestion_control=bbr' /etc/sysctl.conf || echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
+  sysctl -p >/dev/null 2>&1
+  local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+  [ "$cc" = "bbr" ] && ok "BBR activé." || warn "BBR demandé (contrôle : $cc). Un redémarrage peut être nécessaire."
+  pause
+}
+speedtest(){
+  header; section_panel " 📶  TEST DE VITESSE DU SERVEUR "; echo
+  local lat; lat=$(ping -c 2 -W 2 1.1.1.1 2>/dev/null | awk -F'time=' '/time=/{gsub(/ ms/,"",$2); v=$2} END{print v}')
+  printf "   ${GRY}⬇  Mesure de la vitesse en cours…${NC}\n\n"
+
+  local tmp; tmp=$(mktemp)
+  # Mesure sur une DURÉE FIXE (8 s) : bien plus fiable qu'un petit fichier,
+  # qui se termine en une fraction de seconde et gonfle le résultat.
+  (
+    for url in \
+      "https://speed.cloudflare.com/__down?bytes=1000000000" \
+      "https://proof.ovh.net/files/1Gb.dat" \
+      "http://speedtest.tele2.net/1GB.zip" \
+      "http://ipv4.download.thinkbroadband.com/512MB.zip" \
+      "https://fra.download.datapacket.com/100mb.bin"; do
+      res=$(curl -o /dev/null -sL --max-time 8 -w '%{size_download} %{time_total}' "$url" 2>/dev/null)
+      dl=${res%% *}; tt=${res##* }
+      sp=$(awk -v b="${dl:-0}" -v t="${tt:-0}" 'BEGIN{ if(t<=0){print 0} else {printf "%d", b/t} }')
+      if awk -v b="${sp:-0}" 'BEGIN{exit !(b>50000)}'; then echo "$sp" > "$tmp"; break; fi
+    done
+  ) &
+  local pid=$! i=0
+  local frames=( "▰▱▱▱▱▱" "▱▰▱▱▱▱" "▱▱▰▱▱▱" "▱▱▱▰▱▱" "▱▱▱▱▰▱" "▱▱▱▱▱▰" "▱▱▱▱▰▱" "▱▱▱▰▱▱" "▱▱▰▱▱▱" "▱▰▱▱▱▱" )
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r   ${CYN}[${GRN}%s${CYN}]${NC}  ${GRY}analyse du réseau…${NC}   " "${frames[i % ${#frames[@]}]}"
+    i=$((i+1)); sleep 0.12
+  done
+  wait "$pid" 2>/dev/null
+  local sp; sp=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
+  printf "\r%-52s\r" " "
+  if [ -n "$sp" ] && awk -v b="$sp" 'BEGIN{exit !(b>50000)}'; then
+    local mbps mbs; mbps=$(awk -v b="$sp" 'BEGIN{printf "%.1f", b*8/1000000}')
+    mbs=$(awk -v b="$sp" 'BEGIN{printf "%.1f", b/1048576}')
+    line
+    printf "   ${GRN}✔ Vitesse du serveur :${NC} ${WHT}%s Mbps${NC}\n\n" "$mbps"
+  else
+    err "Aucune source de test n'a répondu (réseau du serveur restreint ou pare-feu)."
+    printf "   ${GRY}Latence mesurée : %s ms${NC}\n" "${lat:-n/a}"
+  fi
+  pause
+}
+restart_services(){
+  header; section_panel " ♻️  REDÉMARRAGE DES SERVICES "
+  echo
+  loading "Redémarrage des services"
+  local s pair total=0 done=0
+  # Liste complète des services du panel. Les protocoles PPP et Hysteria2
+  # manquaient : après un correctif, ils continuaient de tourner avec
+  # l'ancienne version et il fallait les relancer à la main en ligne de
+  # commande. Un service absent ou non installé est simplement ignoré.
+  for pair in \
+    "ssh:SSH (OpenSSH)" "dropbear:Dropbear" "xray:Xray" "nginx:Nginx (TLS/WS)" \
+    "nvpanel-slowdns:SlowDNS" "nvpanel-badvpn-7100:UDP 7100" "nvpanel-badvpn-7200:UDP 7200" \
+    "nvpanel-badvpn-7300:UDP 7300" "nvpanel-udp-custom:UDP custom" "wg-quick@wg0:WireGuard" \
+    "xl2tpd:L2TP" "strongswan-starter:IPsec" "strongswan:IPsec" "pptpd:PPTP" \
+    "nvpanel-sstp:SSTP" "hysteria-server:Hysteria2" \
+    "nvpanel-limit:Limite SSH" "nvpanel-xlimit:Limite Xray/SS" "nvpanel-bot:Bot Telegram"; do
+    s="${pair%%:*}"
+    if systemctl is-active --quiet "$s" 2>/dev/null || systemctl is-enabled --quiet "$s" 2>/dev/null; then
+      total=$((total+1))
+      systemctl restart "$s" >/dev/null 2>&1 && done=$((done+1))
+    fi
+  done
+  echo
+  if [ "$total" -eq 0 ]; then
+    warn "Aucun service actif détecté."
+  elif [ "$done" -eq "$total" ]; then
+    ok "$done service(s) redémarré(s) avec succès."
+  else
+    warn "$done/$total service(s) redémarré(s). Si un souci persiste, réessaie dans une minute."
+  fi
+  pause
+}
+renew_cert(){
+  header; section_panel " 📜  RENOUVELLEMENT DES CERTIFICATS "
+  if ! command -v certbot >/dev/null 2>&1; then
+    err "certbot n'est pas installé (le TLS n'a jamais été activé)."; pause; return
+  fi
+  if ! ls /etc/letsencrypt/live/*/fullchain.pem >/dev/null 2>&1; then
+    warn "Aucun certificat Let's Encrypt trouvé."
+    printf "   ${GRY}Active d'abord le TLS (Paramètres → option 2) pour obtenir un certificat.${NC}\n"
+    pause; return
+  fi
+  printf "${CYN}➜${NC} Vérification et renouvellement…\n\n"
+  local out rc; out=$(certbot renew --non-interactive 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && systemctl reload nginx >/dev/null 2>&1
+  if [ "$rc" -ne 0 ]; then
+    err "Le renouvellement a échoué. Lance : certbot renew --dry-run"
+  elif echo "$out" | grep -qiE 'not yet due|no renewals|no certificates'; then
+    ok "Certificat encore valide — aucun renouvellement nécessaire."
+  elif echo "$out" | grep -qiE 'renewed|congratulations|successfully'; then
+    ok "Certificat renouvelé avec succès."
+  else
+    warn "certbot a terminé sans confirmation explicite de renouvellement."
+  fi
+  local c d exp
+  for c in /etc/letsencrypt/live/*/cert.pem; do
+    [ -f "$c" ] || continue
+    d=$(basename "$(dirname "$c")")
+    exp=$(openssl x509 -enddate -noout -in "$c" 2>/dev/null | cut -d= -f2)
+    printf "   ${GRY}%s${NC} → expire le ${WHT}%s${NC}\n" "$d" "$exp"
+  done
+  pause
+}
+change_banner(){
+  header
+  printf "   ${WHT}Bannière / message client${NC}\n   ${GRY}SSH : affichée à la connexion · Autres protocoles : affichée${NC}\n   ${GRY}comme description de la connexion dans l'appli.${NC}\n"
+  printf "   ${GRY}Actuelle :${NC} %s\n\n" "$([ -s /etc/banner ] && head -1 /etc/banner || echo 'aucune')"
+  entry "1" "➕" "Ajouter / modifier la bannière"
+  entry "2" "🗑️" "Supprimer la bannière"
+  entry "0" "⬅️" "Retour"
+  line; ask "$(printf " ${WHT}➤ Choix :${NC} ")" b
+  case "$b" in
+    1)
+      echo; printf "   ${GRY}Saisis ton texte (une ligne). Entrée pour valider.${NC}\n"
+      ask "   Texte : " txt
+      [ -z "$txt" ] && { warn "Inchangé"; pause; return; }
+      printf '%s\n' "$txt" > /etc/banner
+      chmod 644 /etc/banner
+      cp -f /etc/banner /etc/issue.net 2>/dev/null
+
+      # --- OpenSSH : affiche la bannière AVANT l'authentification ---
+      sed -i '/^[#[:space:]]*Banner[[:space:]]/d' /etc/ssh/sshd_config
+      echo 'Banner /etc/banner' >> /etc/ssh/sshd_config
+      systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1
+
+      # --- Dropbear : option -b (utilisé par les tunnels WebSocket/SSL) ---
+      touch /etc/default/dropbear 2>/dev/null
+      sed -i '/DROPBEAR_BANNER/d' /etc/default/dropbear
+      if grep -q '^DROPBEAR_EXTRA_ARGS=' /etc/default/dropbear; then
+        grep -q -- '-b /etc/banner' /etc/default/dropbear || \
+          sed -i 's|^DROPBEAR_EXTRA_ARGS="\?\(.*\)"\?$|DROPBEAR_EXTRA_ARGS="\1 -b /etc/banner"|' /etc/default/dropbear
+      else
+        echo 'DROPBEAR_EXTRA_ARGS="-b /etc/banner"' >> /etc/default/dropbear
+      fi
+      systemctl restart dropbear >/dev/null 2>&1
+      sleep 1
+
+      # Certains systèmes ignorent /etc/default/dropbear : filet de sécurité
+      # → on force l'option directement dans le service systemd.
+      if systemctl is-active --quiet dropbear 2>/dev/null && ! pgrep -af dropbear 2>/dev/null | grep -q -- '-b /etc/banner'; then
+        local ex
+        ex=$(systemctl show -p ExecStart --value dropbear 2>/dev/null | sed -n 's/.*argv\[\]=\([^;]*\).*/\1/p' | head -1)
+        if [ -n "$ex" ]; then
+          mkdir -p /etc/systemd/system/dropbear.service.d
+          printf '[Service]\nExecStart=\nExecStart=%s -b /etc/banner\n' "$ex" \
+            > /etc/systemd/system/dropbear.service.d/nvpanel-banner.conf
+          systemctl daemon-reload >/dev/null 2>&1
+          systemctl restart dropbear >/dev/null 2>&1
+          sleep 1
+        fi
+      fi
+
+      ok "Bannière enregistrée."
+      echo
+      if pgrep -af dropbear 2>/dev/null | grep -q -- '-b /etc/banner'; then
+        printf "   ${GRN}✔${NC} Dropbear  ${GRY}(SSH WebSocket / SSL)${NC}\n"
+      else
+        printf "   ${YLW}–${NC} Dropbear  ${GRY}(non actif sur ce serveur)${NC}\n"
+      fi
+      grep -q '^Banner /etc/banner' /etc/ssh/sshd_config && \
+        printf "   ${GRN}✔${NC} OpenSSH   ${GRY}(SSH direct, SlowDNS, UDP)${NC}\n"
+      printf "   ${GRN}✔${NC} Vmess · Vless · Trojan · Shadowsocks · WireGuard\n"
+      printf "       ${GRY}(le texte apparaît comme description de la connexion)${NC}\n"
+      echo
+      printf "   ${WHT}Important :${NC} ${GRY}les comptes DÉJÀ créés doivent être ré-envoyés${NC}\n"
+      printf "   ${GRY}au client. Va dans le protocole → « Revoir un compte » :${NC}\n"
+      printf "   ${GRY}le lien régénéré contiendra le nouveau texte.${NC}\n"
+      pause ;;
+    2)
+      rm -f /etc/banner
+      sed -i '/^[#[:space:]]*Banner[[:space:]]/d' /etc/ssh/sshd_config
+      systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1
+      [ -f /etc/default/dropbear ] && sed -i 's| *-b /etc/banner||g' /etc/default/dropbear
+      rm -f /etc/systemd/system/dropbear.service.d/nvpanel-banner.conf
+      systemctl daemon-reload >/dev/null 2>&1
+      systemctl restart dropbear >/dev/null 2>&1
+      ok "Bannière supprimée."; pause ;;
+    *) return ;;
+  esac
+}
+script_info(){
+  header; section_panel " ℹ️  À PROPOS "; echo
+  printf "   ${WHT}%s${NC}\n" "$BRAND"
+  printf "   ${GRY}Panel de gestion premium multi-protocoles${NC}\n"
+  printf "   ${CYN}Telegram : %s${NC}\n\n" "$CONTACT"
+  printf "   ${GRY}Protocoles :${NC} SSH · SlowDNS · UDP · Vmess · Vless\n"
+  printf "   ${GRY}             Trojan · Shadowsocks · WireGuard${NC}\n\n"
+  printf "   ${GRY}Compatible :${NC} Ubuntu 20.04/22.04/24.04 · Debian 11/12/13\n"
+  printf "   ${GRY}Architecture :${NC} x86_64 et ARM64 (aarch64)\n"
+  printf "   ${GRY}RAM minimum :${NC} 1 Go\n"
+  pause
+}
+reset_traffic(){
+  header; section_panel " 🧹  RÉINITIALISER LA CONSOMMATION "
+  warn "Remet à zéro les compteurs (hier / aujourd'hui / mois)."
+  printf "   ${RED}➤ Confirmer ? (o/n) : ${NC}"; ask "" r
+  confirm "$r" || { warn "Annulé."; pause; return; }
+  echo
+  # 1) compteur de trafic CLIENT du panel
+  printf "${CYN}➜${NC} Compteurs du panel…\n"
+  [ -x /usr/local/bin/nvpanel-conso ] && /usr/local/bin/nvpanel-conso reset >/dev/null 2>&1
+  rm -f /etc/nvpanel/db/conso /etc/nvpanel/db/conso.tmp 2>/dev/null
+  touch /etc/nvpanel/db/conso
+  # 2) compteurs de quota par compte
+  printf "${CYN}➜${NC} Bandwidth par compte…\n"
+  : > /etc/nvpanel/db/quota_used 2>/dev/null
+  iptables -Z NVPANEL_QUOTA >/dev/null 2>&1
+  # 3) vnstat (utilisé en secours par l'affichage)
+  printf "${CYN}➜${NC} Statistiques réseau…\n"
+  local ifc; ifc=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+  if [ -n "$ifc" ] && command -v vnstat >/dev/null 2>&1; then
+    systemctl stop vnstat >/dev/null 2>&1
+    vnstat --remove -i "$ifc" --force >/dev/null 2>&1
+    rm -f /var/lib/vnstat/"$ifc" /var/lib/vnstat/vnstat.db 2>/dev/null
+    vnstat --add -i "$ifc" >/dev/null 2>&1
+    systemctl start vnstat >/dev/null 2>&1
+  fi
+  # 4) on relance les chaînes pour repartir de zéro
+  [ -x /usr/local/bin/nvpanel-conso ] && /usr/local/bin/nvpanel-conso setup >/dev/null 2>&1
+  echo
+  ok "Tous les compteurs sont à zéro."
+  printf "   ${GRY}Vérifié : historique vidé, compteurs réseau remis à zéro,${NC}\n"
+  printf "   ${GRY}compteurs Bandwidth des comptes réinitialisés.${NC}\n"
+  pause
+}
+
+settings_row(){
+  local LC_ALL=C.UTF-8 n1="$1" t1="$2" n2="$3" t2="$4" c1 c2
+  # printf %-21s compte les OCTETS : les accents (É, È, À…) décalent alors
+  # les séparateurs et la bordure droite. On tronque/padde en caractères réels.
+  c1=${t1:0:21}; c2=${t2:0:21}
+  printf "${CYN}┃${NC} ${GRN}[%02d]${NC} %s%*s ${CYN}│${NC} ${GRN}[%02d]${NC} %s%*s" \
+    "$n1" "$c1" $((21-${#c1})) "" "$n2" "$c2" $((21-${#c2})) ""
+  printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+}
+settings_sep(){ printf "${CYN}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━┿━━━━━━━━━━━━━━━━━━━━━━━━━━━┫${NC}\n"; }
+
+while true; do
+  printf '\033[H\033[2J'
+  _edge "┏" "┓" "PARAMÈTRES DU PANEL"
+  settings_row 1  "DOMAINE"               10 "TEST DE VITESSE"
+  settings_sep
+  settings_row 2  "TLS / HTTPS"           11 "REDÉMARRER SERVICES"
+  settings_sep
+  settings_row 3  "PORT DROPBEAR"         12 "CERTIFICATS SSL"
+  settings_sep
+  settings_row 4  "BILAN DU TRAFIC"       13 "BANNIÈRE SSH"
+  settings_sep
+  settings_row 5  "SAUVEGARDER"           14 "INFO DU SCRIPT"
+  settings_sep
+  settings_row 6  "RESTAURER"             15 "RÉINITIALISER CONSO"
+  settings_sep
+  settings_row 7  "RAM / TRAFIC"          16 "METTRE À JOUR"
+  settings_sep
+  settings_row 8  "CRÉER SWAPRAM"         17 "DÉSINSTALLER SCRIPT"
+  settings_sep
+  settings_row 9  "ACTIVER BBR"            0 "RETOUR"
+  _edge "┗" "┛" "$CONTACT"
+  ask "$(printf " ${WHT}➤ Choix [0-17] :${NC} ")" o || break
+  case "$o" in
+    1) set_domain ;; 2) [ -s /etc/nvpanel/domain ] && install-tls || { err "Définis d'abord un domaine (option 1)."; pause; } ;;
+    3) change_port ;; 4) traffic_report ;; 5) backup_now ;; 6) restore_data ;;
+    7) ram_usage ;; 8) swap_ram ;; 9) enable_bbr ;; 10) speedtest ;;
+    11) restart_services ;; 12) renew_cert ;; 13) change_banner ;;
+    14) script_info ;; 15) reset_traffic ;;
+    16) if [ -x /usr/local/bin/update ]; then
+          exec /usr/local/bin/update
+        else err "Commande de mise à jour introuvable."; pause; fi ;;
+    17) if command -v menu-uninstall >/dev/null 2>&1; then menu-uninstall
+        else err "Commande de désinstallation introuvable."; pause; fi ;;
+    0) break ;;
+    *) warn "Invalide"; sleep 1 ;;
+  esac
+done

@@ -1,0 +1,263 @@
+#!/bin/bash
+# ============================================================
+#  nvpanel · gestion Shadowsocks   (menu-ss)
+#  Interface — logique dans nvpanel-cli (proto = ss)
+# ============================================================
+source /etc/nvpanel/lib/ui.sh
+ui_enter; trap ui_leave EXIT INT TERM HUP
+[ "$EUID" -ne 0 ] && { err "Lance en root."; exit 1; }
+
+header(){ banner; _edge "┏" "┓" "GESTION SHADOWSOCKS"; proto_dash shadowsocks port:8388 shadowsocks; bot; }
+
+ensure_xray() {
+  if [ ! -f /usr/local/etc/xray/config.json ] || ! command -v xray >/dev/null 2>&1; then
+    warn "Xray n'est pas installé."
+    ask " L'installer maintenant ? (o/n) : " r
+    confirm "$r" && install-xray || return 1
+  fi
+}
+
+add_client() {
+  local name days lim out
+  if [ -n "$1" ]; then
+    name="$1"; days="${2:-1}"; lim="${3:-1}"
+  else
+  header; ask " Nom du client : " name
+  [ -z "$name" ] && { err "Nom vide"; pause; return; }
+  ask " Durée (jours) : " days
+  ask " Limite d'appareils (0 = illimité) : " lim; [[ "$lim" =~ ^[0-9]+$ ]] || lim=0
+  fi
+  out=$(nvpanel-cli xadd ss "$name" "$days" "$lim")
+  clear
+  if echo "$out" | head -1 | grep -q '^OK'; then
+    printf "${GRN}"; echo "$out" | tail -n +2; printf "${NC}"
+    ask "$(printf "${GRY}Entrée pour revenir au menu…${NC}")" _pausevar
+  else
+    header
+    case "$(echo "$out" | head -1)" in
+      *"ERR exists"*) err "Ce nom de client existe déjà. Choisis un autre nom." ;;
+      *) err "Échec : $(echo "$out" | head -1)" ;;
+    esac
+    pause
+  fi
+}
+list_clients() {
+  local page=0 size=4 total pages start end i n e s ct ips lim cap shown color choice
+  mapfile -t _rows_ss < <(nvpanel-cli xlist ss)
+  total=${#_rows_ss[@]}; [ "$total" -eq 0 ] && { header; warn "Aucun client Shadowsocks."; pause; return; }
+  pages=$(( (total + size - 1) / size ))
+  while true; do
+    header
+    table_top
+    printf "${CYN}┃${NC} ${WHT}%-16s %-12s %-8s %s${NC}" "COMPTE" "EXPIRE" "ÉTAT" "CONNECTÉ DEPUIS"; printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+    table_sep
+    start=$((page*size)); end=$((start+size)); [ "$end" -gt "$total" ] && end=$total
+    for ((i=start; i<end; i++)); do
+      IFS='|' read -r n e s ct ips lim <<< "${_rows_ss[$i]}"; case "$s" in verrou|expiré|exp+verr|*verr*) color="$RED" ;; *) color="$GRN" ;; esac
+      cap="$lim"; [ -z "$cap" ] || [ "$cap" = 0 ] && cap="∞"
+      ct=${ct:-—}; ct=${ct// /}
+      shown="$ct · ${ips:-0}/${cap} IP"
+      printf "${CYN}┃${NC} %-16s %-12s ${color}%-8s${NC} %s" "$n" "$(_fmtd "${e:-?}")" "${s:-actif}" "$shown"; printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+      [ "$i" -lt $((end-1)) ] && table_sep
+    done
+    table_bot
+    if [ "$pages" -le 1 ]; then pause; return; fi
+    ask "   ➤ n suivante | p précédente | 0 retour : " choice
+    case "${choice,,}" in n) [ "$page" -lt $((pages-1)) ] && page=$((page+1)) ;; p) [ "$page" -gt 0 ] && page=$((page-1)) ;; 0|'') return ;; *) warn "Invalide"; sleep 1 ;; esac
+  done
+}
+
+_rand_name(){ printf 'test%s' "$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c4)"; }
+_rand_pass(){ tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c8; }
+
+trial_client() {
+  banner; top; center " 🎁  COMPTE TEST 24 H " "${BOLD}${WHT}"; bot
+  printf "   ${GRY}Génération d'un client Shadowsocks valable 24 heures…${NC}\n"
+  add_client "$(_rand_name)" 1
+}
+
+pick_client() {
+  PICK=""
+  mapfile -t _cl < <(nvpanel-cli xlist ss | awk -F'|' 'NF{print $1"|"$2"|"$3}')
+  if [ "${#_cl[@]}" -eq 0 ]; then err "Aucun client Shadowsocks."; pause; return 1; fi
+  local page=0 size=6 total=${#_cl[@]} pages start end i nm ex st color n
+  pages=$(( (total + size - 1) / size ))
+  while true; do
+    header; printf "   ${GRY}Clients Shadowsocks · page %d/%d :${NC}\n" "$((page+1))" "$pages"
+    start=$((page*size)); end=$((start+size)); [ "$end" -gt "$total" ] && end=$total
+    for ((i=start; i<end; i++)); do
+      IFS='|' read -r nm ex st <<< "${_cl[$i]}"; case "$st" in verrou|expiré|exp+verr|*verr*) color="$RED" ;; *) color="$GRN" ;; esac
+      printf "   ${WHT}%2d${NC}) %-16s ${GRY}exp %s${NC}  ${color}%s${NC}\n" "$((i+1))" "$nm" "$(_fmtd "$ex")" "$st"
+    done
+    echo; if [ "$pages" -gt 1 ]; then ask "   ➤ N° | n suivante | p précédente | 0 retour : " n; else ask "   ➤ Numéro (0 = annuler) : " n; fi
+    case "${n,,}" in n) [ "$pages" -gt 1 ] && [ "$page" -lt $((pages-1)) ] && page=$((page+1)); continue ;; p) [ "$pages" -gt 1 ] && [ "$page" -gt 0 ] && page=$((page-1)); continue ;; esac
+    [[ "$n" =~ ^[0-9]+$ ]] || { err "Invalide"; sleep 1; continue; }; [ "$n" -eq 0 ] && return 1
+    [ "$n" -ge 1 ] && [ "$n" -le "$total" ] || { err "Hors liste"; sleep 1; continue; }
+    PICK="${_cl[$((n-1))]%%|*}"; return 0
+  done
+}
+blocked_clients() {
+  local name st out
+  header; pick_client || return; name="$PICK"
+  st=$(nvpanel-cli xlist ss 2>/dev/null | awk -F'|' -v n="$name" '$1==n{print $3; exit}')
+  case "$st" in
+    verrou|exp+verr|*verr*)
+      out=$(nvpanel-cli xunlock ss "$name" 2>&1)
+      if echo "$out" | grep -q '^OK'; then ok "$name déverrouillé"; else err "Échec : $out"; fi ;;
+    *)
+      out=$(nvpanel-cli xlock ss "$name" 2>&1)
+      if echo "$out" | grep -q '^OK'; then ok "$name verrouillé"; else err "Échec : $out"; fi ;;
+  esac
+  pause
+}
+
+del_client() {
+  header; pick_client || return; name="$PICK"
+  printf "   ${YLW}Supprimer '%s' ? (o/n) : ${NC}" "$name"; ask "" c; confirm "$c" || { pause; return; }
+  r=$(nvpanel-cli xdel ss "$name"); echo "$r"|grep -q '^OK' && ok "$name supprimé" || err "$r"; pause
+}
+renew_client() {
+  header; pick_client || return; name="$PICK"; ask " Ajouter (jours) : " days
+  r=$(nvpanel-cli xrenew ss "$name" "$days")
+  echo "$r"|grep -q '^OK' && ok "Prolongé" || err "$r"; pause
+}
+view_client() {
+  header; pick_client || return
+  local idx=0 total=${#_cl[@]} i name out nav
+  for ((i=0; i<total; i++)); do
+    [ "${_cl[$i]%%|*}" = "$PICK" ] && { idx=$i; break; }
+  done
+  while true; do
+    name="${_cl[$idx]%%|*}"
+    out=$(nvpanel-cli xinfo ss "$name")
+    clear
+    if echo "$out" | head -1 | grep -q '^OK'; then
+      printf "${GRN}"; echo "$out" | tail -n +2; printf "${NC}"
+    else
+      header; err "Introuvable : $out"
+    fi
+    ask "   ➤ n suivant | p précédent | 0 retour · $((idx+1))/$total : " nav
+    case "${nav,,}" in
+      n) [ "$idx" -lt $((total-1)) ] && idx=$((idx+1)) ;;
+      p) [ "$idx" -gt 0 ] && idx=$((idx-1)) ;;
+      0|'') return ;;
+      *) warn "Invalide"; sleep 1 ;;
+    esac
+  done
+}
+
+cleanup_menu() {
+  while true; do
+    banner; _edge "┏" "┓" "NETTOYAGE SHADOWSOCKS"
+    local tot exp today c r out
+    today=$(date +%F)
+    tot=$(nvpanel-cli xlist ss 2>/dev/null | grep -c '|')
+    exp=$(nvpanel-cli xlist ss 2>/dev/null | awk -F'|' -v d="$today" 'NF && $2!="" && $2<=d {c++} END{print c+0}')
+    printf "${CYN}┃${NC} ${GRY}Clients au total :${NC} ${WHT}%s${NC}    ${GRY}dont expirés :${NC} ${RED}%s${NC}" "$tot" "$exp"; printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+    box_sep
+    compact_menu_entry "1" "🧽" "Supprimer les clients expirés"
+    compact_menu_entry "2" "💥" "Supprimer TOUS les clients"
+    compact_menu_entry "0" "⬅️" "Retour"
+    bot
+    ask "$(printf " ${WHT}➤ Choix :${NC} ")" c
+    case "$c" in
+      1) [ "$exp" -eq 0 ] && { warn "Aucun client expiré."; pause; continue; }
+         printf "   ${YLW}Supprimer les %s client(s) expiré(s) ? (o/n) : ${NC}" "$exp"; ask "" r
+         confirm "$r" || continue
+         out=$(nvpanel-cli purge ss expired)
+         ok "$(echo "$out" | awk '{print $2+0}') client(s) supprimé(s)."; pause ;;
+      2) [ "$tot" -eq 0 ] && { warn "Aucun client."; pause; continue; }
+         warn "Cela supprimera les $tot clients Shadowsocks. Action irréversible."
+         printf "   ${RED}➤ Confirmer la suppression totale ? (o/n) : ${NC}"; ask "" r
+         confirm "$r" || { warn "Annulé."; pause; continue; }
+         out=$(nvpanel-cli purge ss all)
+         ok "$(echo "$out" | awk '{print $2+0}') client(s) supprimé(s)."; pause ;;
+      0) break ;;
+      *) warn "Invalide"; sleep 1 ;;
+    esac
+  done
+}
+
+uninstall_xray(){
+  local xp
+  xp=$(cat /etc/nvpanel/xport 2>/dev/null); xp=${xp:-443}
+  banner; center " 🗑️  DÉSINSTALLER XRAY " "${BOLD}${RED}"; line
+  warn "ATTENTION : le cœur Xray gère 4 protocoles à la fois."
+  printf "   ${YLW}Vmess · Vless · Trojan · Shadowsocks seront TOUS supprimés,${NC}\n"
+  printf "   ${YLW}avec l'ensemble de leurs clients.${NC}\n"
+  printf "   ${GRY}SSH, SlowDNS, UDP, WireGuard, L2TP, PPTP et SSTP ne sont pas touchés.${NC}\n\n"
+  printf "   ${RED}➤ Confirmer la désinstallation ? (o/n) : ${NC}"; ask "" r
+  confirm "$r" || { warn "Annulé."; pause; return; }
+
+  printf "\n${CYN}➜${NC} Arrêt et retrait de Xray…\n"
+  systemctl disable --now xray >/dev/null 2>&1
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service /usr/local/bin/xray /etc/logrotate.d/nvpanel-xray
+  rm -rf /etc/systemd/system/xray.service.d /usr/local/etc/xray /usr/local/share/xray /etc/nvpanel/xray /var/log/xray
+  systemctl daemon-reload >/dev/null 2>&1
+
+  printf "${CYN}➜${NC} Suppression des clients…\n"
+  rm -f /etc/nvpanel/db/vmess /etc/nvpanel/db/vless /etc/nvpanel/db/trojan /etc/nvpanel/db/shadowsocks
+
+  printf "${CYN}➜${NC} Retrait de la façade web…\n"
+  rm -f /etc/nginx/conf.d/rhaff.conf /etc/nginx/nvpanel-ws.conf
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
+  iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null
+  iptables -D INPUT -p tcp --dport "$xp" -j ACCEPT 2>/dev/null
+  iptables -D INPUT -p tcp --dport 8388 -j ACCEPT 2>/dev/null
+  iptables -D INPUT -p udp --dport 8388 -j ACCEPT 2>/dev/null
+  if command -v ufw >/dev/null 2>&1; then
+    for _r in 80/tcp "$xp/tcp" 8388/tcp 8388/udp; do ufw --force delete allow "$_r" >/dev/null 2>&1; done
+  fi
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+  [ -x /usr/local/bin/nvpanel-conso ] && /usr/local/bin/nvpanel-conso setup >/dev/null 2>&1
+  ok "Xray a été désinstallé (Vmess, Vless, Trojan, Shadowsocks)."
+  pause
+}
+
+setup_menu(){
+  while true; do
+    banner; _edge "┏" "┓" "INSTALLER / DÉSINSTALLER XRAY"
+    if systemctl is-active --quiet xray 2>/dev/null; then
+      printf "${CYN}┃${NC} ${GRY}État actuel :${NC} ${GRN}installé et actif${NC}"; printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+    else
+      printf "${CYN}┃${NC} ${GRY}État actuel :${NC} ${RED}non installé${NC}"; printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+    fi
+    printf "${CYN}┃${NC} ${GRY}Concerne Vmess · Vless · Trojan · Shadowsocks${NC}"; printf "\033[%dG${CYN}┃${NC}\n" "$((W + 2))"
+    box_sep
+    compact_menu_entry "1" "⬇️" "Installer / réinstaller"
+    compact_menu_entry "2" "🗑️" "Désinstaller"
+    compact_menu_entry "0" "⬅️" "Retour"
+    bot
+    ask "$(printf " ${WHT}➤ Choix :${NC} ")" c
+    case "$c" in
+      1) install-xray ;;
+      2) uninstall_xray ;;
+      0) break ;;
+      *) warn "Invalide"; sleep 1 ;;
+    esac
+  done
+}
+
+ensure_xray || exit 0
+while true; do
+  header
+  menu_box_top
+  menu_box_entry "1" "➕" "Ajouter un client"
+  menu_box_entry "2" "📋" "Lister les clients"
+  menu_box_entry "3" "🔍" "Revoir un client"
+  menu_box_entry "4" "♻️" "Prolonger un client"
+  menu_box_entry "5" "🔓" "Verrouiller / déverrouiller"
+  menu_box_entry "6" "🗑️" "Supprimer un client"
+  menu_box_entry "7" "🧹" "Nettoyage des comptes"
+  menu_box_entry "8" "🎁" "Compte test 24 h"
+  menu_box_entry "9" "⚙️" "Installer / désinstaller"
+  menu_box_entry "0" "⬅️" "Retour"
+  menu_box_bot
+  ask "$(printf " ${WHT}Choix :${NC} ")" o || break
+  case "$o" in
+    1) add_client ;; 2) list_clients ;; 3) view_client ;; 4) renew_client ;;
+    5) blocked_clients ;; 6) del_client ;; 7) cleanup_menu ;; 8) trial_client ;;
+    9) setup_menu; command -v xray >/dev/null 2>&1 || break ;;
+    0) break ;; *) warn "Invalide"; sleep 1 ;;
+  esac
+done
