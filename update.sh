@@ -4,7 +4,7 @@
 #  Re-télécharge la dernière version depuis GitHub sans toucher
 #  aux comptes/config, régénère la façade nginx, relance le menu.
 # ============================================================
-REPO_RAW="https://raw.githubusercontent.com/Boblevel/auto-scriptV3/main"
+REPO_RAW="https://raw.githubusercontent.com/197695/auto-scriptV3/main"
 umask 077
 RED='\033[0;31m'; GRN='\033[0;32m'; CYN='\033[0;36m'; YLW='\033[0;33m'; WHT='\033[1;37m'; GRY='\033[0;90m'; MAG='\033[0;35m'; NC='\033[0m'
 [ "$EUID" -ne 0 ] && { printf "${RED}✘ Lance en root (sudo su -).${NC}\n"; exit 1; }
