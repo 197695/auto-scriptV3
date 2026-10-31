@@ -2,7 +2,7 @@
 # ============================================================
 #  RHAFF SERVICE · installateur
 # ============================================================
-REPO_RAW="https://raw.githubusercontent.com/Boblevel/auto-scriptV3/main"
+REPO_RAW="https://raw.githubusercontent.com/197695/auto-scriptV3/main"
 BRAND="SERENE WORLD"
 CONTACT="t.me/Serenee09"
 umask 077
