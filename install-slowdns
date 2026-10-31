@@ -11,7 +11,7 @@
 source /etc/nvpanel/lib/ui.sh
 [ "$EUID" -ne 0 ] && { err "Lance en root."; exit 1; }
 
-REPO_RAW="https://raw.githubusercontent.com/Boblevel/auto-scriptV3/main"
+REPO_RAW="https://raw.githubusercontent.com/197695/auto-scriptV3/main"
 DIR=/etc/nvpanel/slowdns
 mkdir -p "$DIR"
 umask 077
